@@ -27,6 +27,16 @@ The sample command writes progress to stderr while it imports. TTY output uses a
 single updating line; redirected output uses plain log lines. Pass `--silent` to
 suppress progress output.
 
+The default extractor writes page content as markdown in the `text` column. Use
+`--format=html` to keep HTML, `--format=text` to strip markup to plain text, or
+pass `content_format=` from library code.
+
+By default, the crawler runs Trafilatura cleanup before converting content and
+extracting links/images, which strips common navigation, footer, sidebar, and ad
+boilerplate. Use `--clean=after-links` to keep links/images from the original
+page while still cleaning the text content, or `--clean=none` to process the raw
+response body.
+
 The CLI persists crawl frontier state by default in `<table>__frontier`, so a
 limited run can be resumed by running the same command again:
 
@@ -43,8 +53,9 @@ with `--frontier-batch-size` or the library `frontier_batch_size=` argument.
 Failed URLs are not retried on resume unless you pass `--retry-failed` or
 `retry_failed=True`.
 
-The crawler creates scalar indexes by default: a BTREE index on the page table
-primary key, plus BTREE `url` and BITMAP `status` indexes on the frontier table.
+The crawler creates indexes by default: a BTREE index on the page table primary
+key, an INVERTED index on `text`, LABEL_LIST indexes on `link_urls` and
+`image_urls`, plus BTREE `url` and BITMAP `status` indexes on the frontier table.
 Pass `--no-indexes` or `create_indexes=False` to skip that. It also runs dataset
 optimization periodically while importing and shows `optimizing`/`optimized` in
 progress output. Tune that with `--optimize-every` or `optimize_every=`, and use
@@ -59,7 +70,13 @@ lower-cased, so an HTML-only crawl can use:
 ```
 
 By default, records are merged on `url` with the columns `url`, `date`,
-`content_type`, and `text`. Pass an async `extract=` callback to derive custom
-columns from the Scrapy response and content bytes. Return `None` from the
-callback to skip the record. Pass an async `progress=` callback to observe import
-progress from library code.
+`content_type`, `text`, `links`, `link_urls`, `images`, and `image_urls`.
+`text` is markdown unless another content format is selected. `links` and
+`images` are struct arrays that keep the source attributes and link text or image
+metadata; `link_urls` and `image_urls` are flattened URL arrays for fast lookup.
+The crawler creates a BTREE index on `url`, an INVERTED index on `text`, and
+LABEL_LIST indexes on `link_urls` and `image_urls`.
+
+Pass an async `extract=` callback to derive custom columns from the Scrapy
+response and content bytes. Return `None` from the callback to skip the record.
+Pass an async `progress=` callback to observe import progress from library code.

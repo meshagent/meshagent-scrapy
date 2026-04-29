@@ -265,6 +265,46 @@ async def _fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
     )
 
 
+async def _fake_scraped_page_with_assets(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+    del kwargs
+    content = (
+        b'<html><body><a href="/next" title="Next title" rel="nofollow" '
+        b'data-id="1">Next <span>Page</span></a>'
+        b'<img src="/hero.png" alt="Hero" width="10"></body></html>'
+    )
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/a",
+            content_type="text/html; charset=utf-8",
+            body=content,
+        ),  # type: ignore[arg-type]
+        content=content,
+        request_url="https://example.com/a",
+    )
+
+
+async def _fake_scraped_page_with_clean_noise(
+    **kwargs: Any,
+) -> AsyncIterator[_ScrapedPage]:
+    del kwargs
+    content = (
+        b"<html><body>"
+        b'<nav><a href="/nav">Navigation</a><img src="/nav.png" alt="Nav"></nav>'
+        b'<article><h1>Main</h1><a href="/main">Main Link</a>'
+        b'<img src="/main.png" alt="Main"></article>'
+        b"</body></html>"
+    )
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/a",
+            content_type="text/html; charset=utf-8",
+            body=content,
+        ),  # type: ignore[arg-type]
+        content=content,
+        request_url="https://example.com/a",
+    )
+
+
 async def _fake_duplicate_primary_key_pages(
     **kwargs: Any,
 ) -> AsyncIterator[_ScrapedPage]:
@@ -358,6 +398,7 @@ async def test_import_domain_uses_default_columns_and_merge(monkeypatch) -> None
         table="pages",
         namespace=["crawls"],
         batch_size=1,
+        clean="none",
     )
 
     assert result.matched_records == 2
@@ -373,11 +414,155 @@ async def test_import_domain_uses_default_columns_and_merge(monkeypatch) -> None
     assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["content_type"] == (
         "text/html; charset=utf-8"
     )
-    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == "Hello A"
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == (
+        "Hello **A**\n"
+    )
     assert [
         call["config"].model_dump()["column"]
         for call in room.datasets.create_index_calls
-    ] == ["url"]
+    ] == ["url", "text", "link_urls", "image_urls"]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_extracts_link_and_image_structs(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_page_with_assets)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        table="pages",
+        clean="none",
+    )
+
+    row = room.datasets.merge_calls[0]["records"].to_pylist()[0]
+    assert row["link_urls"] == ["https://example.com/next"]
+    assert row["links"] == [
+        {
+            "url": "https://example.com/next",
+            "href": "/next",
+            "content": "Next Page",
+            "title": "Next title",
+            "rel": "nofollow",
+            "target": None,
+            "attributes": [
+                {"name": "href", "value": "/next"},
+                {"name": "title", "value": "Next title"},
+                {"name": "rel", "value": "nofollow"},
+                {"name": "data-id", "value": "1"},
+            ],
+        }
+    ]
+    assert row["image_urls"] == ["https://example.com/hero.png"]
+    assert row["images"] == [
+        {
+            "url": "https://example.com/hero.png",
+            "src": "/hero.png",
+            "alt": "Hero",
+            "title": None,
+            "srcset": None,
+            "attributes": [
+                {"name": "src", "value": "/hero.png"},
+                {"name": "alt", "value": "Hero"},
+                {"name": "width", "value": "10"},
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_clean_defaults_before_links(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scrapy,
+        "_iter_scraped_pages",
+        _fake_scraped_page_with_clean_noise,
+    )
+
+    async def clean_content(**kwargs: Any) -> bytes:
+        del kwargs
+        return (
+            b'<html><body><article><h1>Main</h1><a href="/main">Main Link</a>'
+            b'<img src="/main.png" alt="Main"></article></body></html>'
+        )
+
+    monkeypatch.setattr(scrapy, "_trafilatura_content", clean_content)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        table="pages",
+    )
+
+    row = room.datasets.merge_calls[0]["records"].to_pylist()[0]
+    assert row["link_urls"] == ["https://example.com/main"]
+    assert row["image_urls"] == ["https://example.com/main.png"]
+    assert "Main" in row["text"]
+    assert "Navigation" not in row["text"]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_clean_can_run_after_links(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scrapy,
+        "_iter_scraped_pages",
+        _fake_scraped_page_with_clean_noise,
+    )
+
+    async def clean_content(**kwargs: Any) -> bytes:
+        del kwargs
+        return b"<html><body><article><h1>Main</h1></article></body></html>"
+
+    monkeypatch.setattr(scrapy, "_trafilatura_content", clean_content)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        table="pages",
+        clean="after-links",
+    )
+
+    row = room.datasets.merge_calls[0]["records"].to_pylist()[0]
+    assert row["link_urls"] == [
+        "https://example.com/nav",
+        "https://example.com/main",
+    ]
+    assert row["image_urls"] == [
+        "https://example.com/nav.png",
+        "https://example.com/main.png",
+    ]
+    assert "Main" in row["text"]
+    assert "Navigation" not in row["text"]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_clean_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scrapy,
+        "_iter_scraped_pages",
+        _fake_scraped_page_with_clean_noise,
+    )
+
+    async def clean_content(**kwargs: Any) -> bytes:
+        raise AssertionError("cleaning should not run")
+
+    monkeypatch.setattr(scrapy, "_trafilatura_content", clean_content)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        table="pages",
+        clean="none",
+    )
+
+    row = room.datasets.merge_calls[0]["records"].to_pylist()[0]
+    assert row["link_urls"] == [
+        "https://example.com/nav",
+        "https://example.com/main",
+    ]
+    assert "Navigation" in row["text"]
 
 
 @pytest.mark.asyncio
@@ -406,6 +591,66 @@ async def test_extract_callback_can_filter_records(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_import_domain_can_strip_html_to_text(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=1,
+        content_format="text",
+        clean="none",
+    )
+
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == "Hello A"
+
+
+@pytest.mark.asyncio
+async def test_import_domain_can_keep_html(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=1,
+        content_format="html",
+        clean="none",
+    )
+
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == (
+        "<html><head><script>x()</script></head><body>Hello <b>A</b></body></html>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_import_domain_rejects_unknown_content_format(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    with pytest.raises(ValueError, match="content_format"):
+        await scrapy.import_domain_with_scrapy(
+            room,  # type: ignore[arg-type]
+            url="https://example.com",
+            content_format="json",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_domain_rejects_unknown_clean(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    with pytest.raises(ValueError, match="clean"):
+        await scrapy.import_domain_with_scrapy(
+            room,  # type: ignore[arg-type]
+            url="https://example.com",
+            clean="always",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
 async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) -> None:
     monkeypatch.setattr(
         scrapy, "_iter_scraped_pages", _fake_duplicate_primary_key_pages
@@ -416,6 +661,7 @@ async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) ->
         room,  # type: ignore[arg-type]
         url="https://example.com",
         batch_size=2,
+        clean="none",
     )
 
     assert result.matched_records == 2
@@ -425,7 +671,11 @@ async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) ->
             "url": "https://example.com/canonical",
             "date": room.datasets.merge_calls[0]["records"].to_pylist()[0]["date"],
             "content_type": "text/html; charset=utf-8",
-            "text": "Second",
+            "text": "Second\n",
+            "links": [],
+            "link_urls": [],
+            "images": [],
+            "image_urls": [],
         }
     ]
 
@@ -488,6 +738,7 @@ async def test_response_filter_skips_non_matching_responses(monkeypatch) -> None
         room,  # type: ignore[arg-type]
         url="https://example.com",
         response_filter="contains(headers.\"content-type\", 'text/html')",
+        clean="none",
         progress=progress,
     )
 
@@ -499,7 +750,11 @@ async def test_response_filter_skips_non_matching_responses(monkeypatch) -> None
             "url": "https://example.com/a",
             "date": room.datasets.merge_calls[0]["records"].to_pylist()[0]["date"],
             "content_type": "text/html; charset=utf-8",
-            "text": "Hello A",
+            "text": "Hello **A**\n",
+            "links": [],
+            "link_urls": [],
+            "images": [],
+            "image_urls": [],
         }
     ]
     assert "response_filtered" in [update.stage for update in updates]
@@ -581,6 +836,9 @@ async def test_resume_persists_frontier_and_marks_imported_urls_done(
         for call in room.datasets.create_index_calls
     ] == [
         ("pages", "url"),
+        ("pages", "text"),
+        ("pages", "link_urls"),
+        ("pages", "image_urls"),
         ("pages__frontier", "url"),
         ("pages__frontier", "status"),
     ]

@@ -1,4 +1,6 @@
 from .scrapy import (
+    CleanMode,
+    ContentFormat,
     ExtractCallback,
     ProgressCallback,
     ScrapyImportProgress,
@@ -9,6 +11,8 @@ from .scrapy import (
 from .version import __version__
 
 __all__ = [
+    "CleanMode",
+    "ContentFormat",
     "ExtractCallback",
     "ProgressCallback",
     "ScrapyImportProgress",

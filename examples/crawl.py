@@ -74,10 +74,22 @@ def _parser() -> argparse.ArgumentParser:
         help="JMESPath expression over url, status, headers",
     )
     parser.add_argument(
+        "--format",
+        choices=["md", "html", "text"],
+        default="md",
+        help="Content format for the default text column",
+    )
+    parser.add_argument(
+        "--clean",
+        choices=["before-links", "after-links", "none"],
+        default="before-links",
+        help="Run Trafilatura cleanup before links/images, after links/images, or not at all",
+    )
+    parser.add_argument(
         "--indexes",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Create scalar indexes for page and frontier tables",
+        help="Create indexes for page and frontier tables",
     )
     parser.add_argument(
         "--optimize-every",
@@ -181,6 +193,8 @@ async def _main() -> None:
                 namespace=_namespace(args.namespace),
                 url_filter=_url_filter(args.url),
                 response_filter=args.response_filter,
+                content_format=args.format,
+                clean=args.clean,
                 limit=args.limit,
                 user_agent=args.user_agent,
                 respect_robots_txt=args.respect_robots_txt,
