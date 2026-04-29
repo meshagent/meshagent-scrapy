@@ -18,22 +18,63 @@ class _Headers:
     def get(self, key: bytes) -> bytes | None:
         return self._values.get(key)
 
+    def to_unicode_dict(self) -> dict[str, str]:
+        return {
+            key.decode("latin-1", errors="replace"): value.decode(
+                "latin-1",
+                errors="replace",
+            )
+            for key, value in self._values.items()
+        }
+
+
+class _Request:
+    def __init__(
+        self,
+        *,
+        url: str,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        self.url = url
+        self.meta = meta or {}
+
 
 class _Response:
-    def __init__(self, *, url: str, content_type: str, body: bytes) -> None:
+    def __init__(
+        self,
+        *,
+        url: str,
+        content_type: str,
+        body: bytes,
+        status: int = 200,
+        request: _Request | None = None,
+    ) -> None:
         self.url = url
+        self.status = status
+        self.request = request
         self.headers = _Headers({b"Content-Type": content_type.encode()})
         self.body = body
+
+
+@dataclass
+class _FakeIndex:
+    name: str
+    columns: list[str]
+    type: str
 
 
 class _FakeDatasets:
     def __init__(self) -> None:
         self.schemas: dict[str, pa.Schema] = {}
         self.search_rows: dict[str, list[dict[str, Any]]] = {}
+        self.indexes: dict[str, list[_FakeIndex]] = {}
         self.create_calls: list[dict[str, Any]] = []
         self.add_columns_calls: list[dict[str, Any]] = []
         self.merge_calls: list[dict[str, Any]] = []
         self.search_stream_calls: list[dict[str, Any]] = []
+        self.list_indexes_calls: list[dict[str, Any]] = []
+        self.create_index_calls: list[dict[str, Any]] = []
+        self.optimize_calls: list[dict[str, Any]] = []
 
     async def create_table_with_schema(
         self,
@@ -137,6 +178,65 @@ class _FakeDatasets:
         if rows:
             yield pa.Table.from_pylist(rows)
 
+    async def list_indexes(
+        self,
+        *,
+        table: str,
+        namespace: list[str] | None = None,
+        branch: str | None = None,
+    ) -> list[_FakeIndex]:
+        self.list_indexes_calls.append(
+            {
+                "table": table,
+                "namespace": namespace,
+                "branch": branch,
+            }
+        )
+        return self.indexes.setdefault(table, [])
+
+    async def create_index(
+        self,
+        *,
+        table: str,
+        config: Any,
+        namespace: list[str] | None = None,
+        branch: str | None = None,
+    ) -> None:
+        self.create_index_calls.append(
+            {
+                "table": table,
+                "config": config,
+                "namespace": namespace,
+                "branch": branch,
+            }
+        )
+        self.indexes.setdefault(table, []).append(
+            _FakeIndex(
+                name=config.name,
+                columns=(
+                    [config.column] if isinstance(config.column, str) else config.column
+                ),
+                type=config.index_type,
+            )
+        )
+
+    async def optimize(
+        self,
+        *,
+        table: str,
+        namespace: list[str] | None = None,
+        branch: str | None = None,
+        config: Any = None,
+    ) -> None:
+        self.optimize_calls.append(
+            {
+                "table": table,
+                "namespace": namespace,
+                "branch": branch,
+                "config": config,
+            }
+        )
+
 
 @dataclass
 class _FakeRoom:
@@ -152,6 +252,7 @@ async def _fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
             body=b"<html><head><script>x()</script></head><body>Hello <b>A</b></body></html>",
         ),  # type: ignore[arg-type]
         content=b"<html><head><script>x()</script></head><body>Hello <b>A</b></body></html>",
+        request_url="https://example.com/a",
     )
     yield _ScrapedPage(
         response=_Response(
@@ -160,23 +261,90 @@ async def _fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
             body=b"Plain B",
         ),  # type: ignore[arg-type]
         content=b"Plain B",
+        request_url="https://example.com/b",
+    )
+
+
+async def _fake_duplicate_primary_key_pages(
+    **kwargs: Any,
+) -> AsyncIterator[_ScrapedPage]:
+    del kwargs
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/canonical",
+            content_type="text/html; charset=utf-8",
+            body=b"First",
+        ),  # type: ignore[arg-type]
+        content=b"First",
+        request_url="https://example.com/a",
+    )
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/canonical",
+            content_type="text/html; charset=utf-8",
+            body=b"Second",
+        ),  # type: ignore[arg-type]
+        content=b"Second",
+        request_url="https://example.com/b",
     )
 
 
 async def _fake_scraped_page_with_discovery(
     **kwargs: Any,
 ) -> AsyncIterator[_ScrapedPage]:
-    assert kwargs["start_urls"] == ["https://example.com"]
-    assert kwargs["known_urls"] == {"https://example.com"}
+    assert kwargs["start_urls"] == ["https://example.com/"]
+    assert kwargs["known_urls"] == {"https://example.com/"}
     yield _ScrapedPage(
         response=_Response(
-            url="https://example.com",
+            url="https://example.com/",
             content_type="text/html; charset=utf-8",
             body=b"<a href='/next'>Next</a>",
         ),  # type: ignore[arg-type]
         content=b"<a href='/next'>Next</a>",
+        request_url="https://example.com/",
         discovered_urls=("https://example.com/next",),
     )
+
+
+async def _fake_redirected_seed_page(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+    assert kwargs["start_urls"] == ["https://example.com/"]
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://www.example.com/",
+            content_type="text/html; charset=utf-8",
+            body=b"Home",
+        ),  # type: ignore[arg-type]
+        content=b"Home",
+        request_url="https://example.com/",
+    )
+
+
+async def _fake_redirect_chain_page(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+    assert kwargs["start_urls"] == ["https://example.com/old.html"]
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/new",
+            content_type="text/html; charset=utf-8",
+            body=b"New",
+            request=_Request(
+                url="https://example.com/new",
+                meta={"redirect_urls": ["https://example.com/old.html"]},
+            ),
+        ),  # type: ignore[arg-type]
+        content=b"New",
+        request_url="https://example.com/new",
+        redirect_urls=("https://example.com/old.html",),
+    )
+
+
+async def _fake_no_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+    assert kwargs["start_urls"] == []
+    if False:
+        yield _ScrapedPage(  # pragma: no cover
+            response=_Response(url="", content_type="", body=b""),  # type: ignore[arg-type]
+            content=b"",
+            request_url="",
+        )
 
 
 @pytest.mark.asyncio
@@ -206,6 +374,10 @@ async def test_import_domain_uses_default_columns_and_merge(monkeypatch) -> None
         "text/html; charset=utf-8"
     )
     assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == "Hello A"
+    assert [
+        call["config"].model_dump()["column"]
+        for call in room.datasets.create_index_calls
+    ] == ["url"]
 
 
 @pytest.mark.asyncio
@@ -230,6 +402,31 @@ async def test_extract_callback_can_filter_records(monkeypatch) -> None:
     assert result.skipped_records == 1
     assert room.datasets.merge_calls[0]["records"].to_pylist() == [
         {"url": "https://example.com/a", "title": "A"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scrapy, "_iter_scraped_pages", _fake_duplicate_primary_key_pages
+    )
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=2,
+    )
+
+    assert result.matched_records == 2
+    assert result.imported_records == 1
+    assert room.datasets.merge_calls[0]["records"].to_pylist() == [
+        {
+            "url": "https://example.com/canonical",
+            "date": room.datasets.merge_calls[0]["records"].to_pylist()[0]["date"],
+            "content_type": "text/html; charset=utf-8",
+            "text": "Second",
+        }
     ]
 
 
@@ -262,6 +459,75 @@ async def test_import_domain_reports_progress(monkeypatch) -> None:
     assert updates[-1].matched_records == 2
     assert updates[-1].imported_records == 2
     assert updates[-1].pending_records == 0
+
+
+@pytest.mark.asyncio
+async def test_import_domain_can_skip_indexes(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        create_indexes=False,
+    )
+
+    assert room.datasets.create_index_calls == []
+
+
+@pytest.mark.asyncio
+async def test_response_filter_skips_non_matching_responses(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+    updates: list[ScrapyImportProgress] = []
+
+    async def progress(update: ScrapyImportProgress) -> None:
+        updates.append(update)
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        response_filter="contains(headers.\"content-type\", 'text/html')",
+        progress=progress,
+    )
+
+    assert result.matched_records == 2
+    assert result.imported_records == 1
+    assert result.skipped_records == 1
+    assert room.datasets.merge_calls[0]["records"].to_pylist() == [
+        {
+            "url": "https://example.com/a",
+            "date": room.datasets.merge_calls[0]["records"].to_pylist()[0]["date"],
+            "content_type": "text/html; charset=utf-8",
+            "text": "Hello A",
+        }
+    ]
+    assert "response_filtered" in [update.stage for update in updates]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_optimizes_periodically(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+    updates: list[ScrapyImportProgress] = []
+
+    async def progress(update: ScrapyImportProgress) -> None:
+        updates.append(update)
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=1,
+        optimize_every=1,
+        progress=progress,
+    )
+
+    assert [call["table"] for call in room.datasets.optimize_calls] == [
+        "scrapy",
+        "scrapy",
+    ]
+    assert "optimizing" in [update.stage for update in updates]
+    assert "optimized" in [update.stage for update in updates]
 
 
 def test_url_helpers() -> None:
@@ -308,5 +574,120 @@ async def test_resume_persists_frontier_and_marks_imported_urls_done(
     assert frontier_merges[0][0]["status"] == "pending"
     assert frontier_merges[1][0]["url"] == "https://example.com/next"
     assert frontier_merges[1][0]["status"] == "pending"
-    assert frontier_merges[2][0]["url"] == "https://example.com"
+    assert frontier_merges[2][0]["url"] == "https://example.com/"
     assert frontier_merges[2][0]["status"] == "done"
+    assert [
+        (call["table"], call["config"].model_dump()["column"])
+        for call in room.datasets.create_index_calls
+    ] == [
+        ("pages", "url"),
+        ("pages__frontier", "url"),
+        ("pages__frontier", "status"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_marks_seed_request_url_done_when_response_url_differs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_redirected_seed_page)
+    room = _FakeRoom(datasets=_FakeDatasets())
+    room.datasets.search_rows["pages__frontier"] = [
+        {
+            "url": "https://example.com/",
+            "status": "pending",
+            "discovered_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "source_url": None,
+            "error": None,
+        }
+    ]
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        table="pages",
+        resume=True,
+    )
+
+    assert result.imported_records == 1
+    frontier_rows = {
+        row["url"]: row["status"]
+        for row in room.datasets.search_rows["pages__frontier"]
+    }
+    assert frontier_rows["https://example.com/"] == "done"
+    assert frontier_rows["https://www.example.com/"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_resume_marks_redirect_chain_urls_done(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_redirect_chain_page)
+    room = _FakeRoom(datasets=_FakeDatasets())
+    room.datasets.search_rows["pages__frontier"] = [
+        {
+            "url": "https://example.com/old.html",
+            "status": "pending",
+            "discovered_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "source_url": None,
+            "error": None,
+        }
+    ]
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com/old.html",
+        table="pages",
+        resume=True,
+    )
+
+    assert result.imported_records == 1
+    frontier_rows = {
+        row["url"]: row["status"]
+        for row in room.datasets.search_rows["pages__frontier"]
+    }
+    assert frontier_rows["https://example.com/old.html"] == "done"
+    assert frontier_rows["https://example.com/new"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_resume_reconciles_done_aliases_before_crawling(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_no_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+    room.datasets.search_rows["pages__frontier"] = [
+        {"url": "https://example.com/page", "status": "done"},
+        {"url": "https://example.com/page#main-content", "status": "pending"},
+    ]
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com/page",
+        table="pages",
+        resume=True,
+    )
+
+    assert result.imported_records == 0
+    frontier_rows = {
+        row["url"]: row["status"]
+        for row in room.datasets.search_rows["pages__frontier"]
+    }
+    assert frontier_rows["https://example.com/page"] == "done"
+    assert frontier_rows["https://example.com/page#main-content"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_load_frontier_normalizes_urls_and_prefers_done_status() -> None:
+    room = _FakeRoom(datasets=_FakeDatasets())
+    room.datasets.search_rows["pages__frontier"] = [
+        {"url": "https://example.com", "status": "pending"},
+        {"url": "https://example.com/", "status": "done"},
+    ]
+
+    frontier = await scrapy._load_frontier(
+        room=room,  # type: ignore[arg-type]
+        table="pages__frontier",
+        namespace=None,
+        branch=None,
+    )
+
+    assert frontier == {"https://example.com/": "done"}

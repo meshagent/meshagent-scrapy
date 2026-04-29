@@ -9,11 +9,12 @@ import logging
 import re
 import warnings
 from typing import Any, TypeAlias
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
+import jmespath
 import pyarrow as pa
 
-from meshagent.api import RoomClient
+from meshagent.api import DatasetIndexConfig, DatasetOptimizeConfig, RoomClient
 
 from scrapy import Request, Spider
 from scrapy.crawler import AsyncCrawlerRunner
@@ -68,6 +69,8 @@ ProgressCallback: TypeAlias = Callable[
 class _ScrapedPage:
     response: Response
     content: bytes
+    request_url: str
+    redirect_urls: tuple[str, ...] = ()
     discovered_urls: tuple[str, ...] = ()
 
 
@@ -78,6 +81,12 @@ class _ScrapedFailure:
 
 
 _ScrapedEvent: TypeAlias = _ScrapedPage | _ScrapedFailure
+
+
+@dataclass(frozen=True)
+class _FrontierState:
+    statuses: dict[str, str]
+    aliases: dict[str, dict[str, str]]
 
 
 class _TextExtractor(HTMLParser):
@@ -115,14 +124,19 @@ async def import_domain_with_scrapy(
     extract: ExtractCallback | None = None,
     schema: pa.Schema | None = None,
     primary_key: str = "url",
+    response_filter: str | None = None,
     namespace: list[str] | None = None,
     branch: str | None = None,
     limit: int | None = None,
     batch_size: int = 100,
+    frontier_batch_size: int = 500,
     user_agent: str | None = None,
     respect_robots_txt: bool = False,
     resume: bool = False,
+    retry_failed: bool = False,
     frontier_table: str | None = None,
+    create_indexes: bool = True,
+    optimize_every: int | None = 5000,
     progress: ProgressCallback | None = None,
 ) -> ScrapyImportResult:
     """Spider a domain with Scrapy and import pages into a room dataset.
@@ -135,14 +149,23 @@ async def import_domain_with_scrapy(
 
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
+    if frontier_batch_size <= 0:
+        raise ValueError("frontier_batch_size must be greater than zero")
     if primary_key == "":
         raise ValueError("primary_key must be non-empty")
     if limit is not None and limit < 0:
         raise ValueError("limit must be greater than or equal to zero")
+    if optimize_every is not None and optimize_every <= 0:
+        raise ValueError("optimize_every must be greater than zero or None")
 
     extractor = extract or _default_extract
+    response_filter_expression = (
+        jmespath.compile(response_filter) if response_filter is not None else None
+    )
     schema = schema or (_default_schema() if extract is None else None)
     frontier_table_name = frontier_table or f"{table}__frontier"
+    content_indexes_ready = not create_indexes
+    frontier_indexes_ready = not create_indexes
     if schema is not None:
         await _ensure_table(
             room=room,
@@ -151,20 +174,54 @@ async def import_domain_with_scrapy(
             namespace=namespace,
             branch=branch,
         )
+        if create_indexes:
+            content_indexes_ready = await _ensure_scrapy_indexes(
+                room=room,
+                table=table,
+                primary_key=primary_key,
+                namespace=namespace,
+                branch=branch,
+            )
 
-    start_url = _start_url(url)
+    start_url = _frontier_url(_start_url(url))
     frontier: dict[str, str] = {}
+    frontier_aliases: dict[str, dict[str, str]] = {}
     start_urls = [start_url]
     if resume:
+        await _report_progress(
+            progress,
+            stage="loading_frontier",
+            matched_records=0,
+            imported_records=0,
+            skipped_records=0,
+            pages_read=0,
+            pending_records=0,
+        )
         await _ensure_frontier_table(
             room=room,
             table=frontier_table_name,
             namespace=namespace,
             branch=branch,
         )
-        frontier = await _load_frontier(
+        if create_indexes:
+            frontier_indexes_ready = await _ensure_frontier_indexes(
+                room=room,
+                table=frontier_table_name,
+                namespace=namespace,
+                branch=branch,
+            )
+        frontier_state = await _load_frontier_state(
             room=room,
             table=frontier_table_name,
+            namespace=namespace,
+            branch=branch,
+        )
+        frontier = frontier_state.statuses
+        frontier_aliases = frontier_state.aliases
+        await _reconcile_frontier_aliases(
+            room=room,
+            table=frontier_table_name,
+            state=frontier_state,
             namespace=namespace,
             branch=branch,
         )
@@ -175,15 +232,33 @@ async def import_domain_with_scrapy(
                 rows=[_frontier_row(url=start_url, status="pending")],
                 namespace=namespace,
                 branch=branch,
+                ensure=False,
             )
             frontier[start_url] = "pending"
+            frontier_aliases.setdefault(start_url, {})[start_url] = "pending"
+            if create_indexes and not frontier_indexes_ready:
+                frontier_indexes_ready = await _ensure_frontier_indexes(
+                    room=room,
+                    table=frontier_table_name,
+                    namespace=namespace,
+                    branch=branch,
+                )
         start_urls = [
             pending_url
             for pending_url, status in frontier.items()
-            if status in {"pending", "failed"}
+            if status == "pending" or (retry_failed and status == "failed")
         ]
         if limit is not None:
             start_urls = start_urls[:limit]
+        await _report_progress(
+            progress,
+            stage="frontier_loaded",
+            matched_records=0,
+            imported_records=0,
+            skipped_records=0,
+            pages_read=0,
+            pending_records=len(start_urls),
+        )
 
     matched_records = 0
     imported_records = 0
@@ -192,7 +267,84 @@ async def import_domain_with_scrapy(
     discovered_urls = 0
     failed_urls = 0
     batch: list[dict[str, Any]] = []
-    batch_urls: list[str] = []
+    batch_frontier_urls: list[str] = []
+    frontier_batch: list[dict[str, Any]] = []
+    unresolved_start_urls = set(start_urls) if resume else set()
+    writes_since_optimize = 0
+    content_table_available = schema is not None
+
+    async def maybe_optimize(current_url: str | None = None) -> None:
+        nonlocal writes_since_optimize
+        if optimize_every is None or writes_since_optimize < optimize_every:
+            return
+        tables = [table] if content_table_available else []
+        if resume:
+            tables.append(frontier_table_name)
+        if not tables:
+            return
+        await _report_progress(
+            progress,
+            stage="optimizing",
+            matched_records=matched_records,
+            imported_records=imported_records,
+            skipped_records=skipped_records,
+            pages_read=pages_read,
+            pending_records=len(batch),
+            current_url=current_url,
+        )
+        await _optimize_tables(
+            room=room,
+            tables=tables,
+            namespace=namespace,
+            branch=branch,
+        )
+        writes_since_optimize = 0
+        await _report_progress(
+            progress,
+            stage="optimized",
+            matched_records=matched_records,
+            imported_records=imported_records,
+            skipped_records=skipped_records,
+            pages_read=pages_read,
+            pending_records=len(batch),
+            current_url=current_url,
+        )
+
+    async def flush_frontier_batch() -> None:
+        nonlocal frontier_batch, frontier_indexes_ready, writes_since_optimize
+        if not resume or not frontier_batch:
+            return
+        rows = frontier_batch
+        frontier_batch = []
+        await _merge_frontier_rows(
+            room=room,
+            table=frontier_table_name,
+            rows=rows,
+            namespace=namespace,
+            branch=branch,
+            ensure=False,
+        )
+        if create_indexes and not frontier_indexes_ready:
+            frontier_indexes_ready = await _ensure_frontier_indexes(
+                room=room,
+                table=frontier_table_name,
+                namespace=namespace,
+                branch=branch,
+            )
+        writes_since_optimize += len(rows)
+        await maybe_optimize()
+
+    async def append_frontier_rows(rows: list[dict[str, Any]]) -> None:
+        if not resume or not rows:
+            return
+        frontier_batch.extend(rows)
+        if len(frontier_batch) >= frontier_batch_size:
+            await flush_frontier_batch()
+
+    def resolve_start_urls(urls: Sequence[str]) -> None:
+        for resolved_url in urls:
+            unresolved_start_urls.discard(_frontier_url(resolved_url))
+
     await _report_progress(
         progress,
         stage="started",
@@ -215,19 +367,27 @@ async def import_domain_with_scrapy(
         if isinstance(event, _ScrapedFailure):
             failed_urls += 1
             if resume:
-                frontier[event.url] = "failed"
-                await _merge_frontier_rows(
-                    room=room,
-                    table=frontier_table_name,
-                    rows=[
+                failed_frontier_urls = _expand_frontier_urls(
+                    [event.url],
+                    aliases=frontier_aliases,
+                )
+                for failed_frontier_url in failed_frontier_urls:
+                    resolve_start_urls([failed_frontier_url])
+                    _set_frontier_alias_status(
+                        frontier=frontier,
+                        aliases=frontier_aliases,
+                        url=failed_frontier_url,
+                        status="failed",
+                    )
+                await append_frontier_rows(
+                    [
                         _frontier_row(
-                            url=event.url,
+                            url=failed_frontier_url,
                             status="failed",
                             error=event.error,
                         )
-                    ],
-                    namespace=namespace,
-                    branch=branch,
+                        for failed_frontier_url in failed_frontier_urls
+                    ]
                 )
             await _report_progress(
                 progress,
@@ -242,28 +402,31 @@ async def import_domain_with_scrapy(
             continue
 
         page = event
+        if resume:
+            resolve_start_urls(
+                _expand_frontier_urls(
+                    _page_frontier_urls(page),
+                    aliases=frontier_aliases,
+                )
+            )
         if resume and page.discovered_urls:
             new_frontier_rows = []
             for discovered_url in page.discovered_urls:
-                if discovered_url in frontier:
+                frontier_url = _frontier_url(discovered_url)
+                if frontier_url in frontier:
                     continue
-                frontier[discovered_url] = "pending"
+                frontier[frontier_url] = "pending"
+                frontier_aliases.setdefault(frontier_url, {})[frontier_url] = "pending"
                 discovered_urls += 1
                 new_frontier_rows.append(
                     _frontier_row(
-                        url=discovered_url,
+                        url=frontier_url,
                         status="pending",
                         source_url=page.response.url,
                     )
                 )
             if new_frontier_rows:
-                await _merge_frontier_rows(
-                    room=room,
-                    table=frontier_table_name,
-                    rows=new_frontier_rows,
-                    namespace=namespace,
-                    branch=branch,
-                )
+                await append_frontier_rows(new_frontier_rows)
                 await _report_progress(
                     progress,
                     stage="frontier_discovered",
@@ -287,23 +450,66 @@ async def import_domain_with_scrapy(
             pending_records=len(batch),
             current_url=page.response.url,
         )
+        if response_filter_expression is not None and not bool(
+            response_filter_expression.search(_response_filter_document(page.response))
+        ):
+            skipped_records += 1
+            if resume:
+                skipped_urls = _expand_frontier_urls(
+                    _page_frontier_urls(page),
+                    aliases=frontier_aliases,
+                )
+                for skipped_url in skipped_urls:
+                    _set_frontier_alias_status(
+                        frontier=frontier,
+                        aliases=frontier_aliases,
+                        url=skipped_url,
+                        status="skipped",
+                    )
+                await append_frontier_rows(
+                    [
+                        _frontier_row(
+                            url=skipped_url,
+                            status="skipped",
+                        )
+                        for skipped_url in skipped_urls
+                    ]
+                )
+            await _report_progress(
+                progress,
+                stage="response_filtered",
+                matched_records=matched_records,
+                imported_records=imported_records,
+                skipped_records=skipped_records,
+                pages_read=pages_read,
+                pending_records=len(batch),
+                current_url=page.response.url,
+            )
+            continue
         try:
             extracted = await extractor(page.response, page.content)
             if extracted is None:
                 skipped_records += 1
                 if resume:
-                    frontier[page.response.url] = "skipped"
-                    await _merge_frontier_rows(
-                        room=room,
-                        table=frontier_table_name,
-                        rows=[
+                    skipped_urls = _expand_frontier_urls(
+                        _page_frontier_urls(page),
+                        aliases=frontier_aliases,
+                    )
+                    for skipped_url in skipped_urls:
+                        _set_frontier_alias_status(
+                            frontier=frontier,
+                            aliases=frontier_aliases,
+                            url=skipped_url,
+                            status="skipped",
+                        )
+                    await append_frontier_rows(
+                        [
                             _frontier_row(
-                                url=page.response.url,
+                                url=skipped_url,
                                 status="skipped",
                             )
-                        ],
-                        namespace=namespace,
-                        branch=branch,
+                            for skipped_url in skipped_urls
+                        ]
                     )
                 await _report_progress(
                     progress,
@@ -323,7 +529,7 @@ async def import_domain_with_scrapy(
                     f"extract callback must return primary key column {primary_key!r}"
                 )
             batch.append(row)
-            batch_urls.append(page.response.url)
+            batch_frontier_urls.extend(_page_frontier_urls(page))
             await _report_progress(
                 progress,
                 stage="record_extracted",
@@ -335,32 +541,65 @@ async def import_domain_with_scrapy(
                 current_url=page.response.url,
             )
             if len(batch) >= batch_size:
-                merged_urls = batch_urls
+                merged_urls = _unique(batch_frontier_urls)
+                rows_to_merge = _dedupe_rows_by_primary_key(
+                    rows=batch,
+                    primary_key=primary_key,
+                )
                 schema = await _merge_batch(
                     room=room,
                     table=table,
-                    rows=batch,
+                    rows=rows_to_merge,
                     schema=schema,
                     primary_key=primary_key,
                     namespace=namespace,
                     branch=branch,
                 )
-                imported_records += len(batch)
+                content_table_available = True
+                if create_indexes and not content_indexes_ready:
+                    content_indexes_ready = await _ensure_scrapy_indexes(
+                        room=room,
+                        table=table,
+                        primary_key=primary_key,
+                        namespace=namespace,
+                        branch=branch,
+                    )
+                imported_records += len(rows_to_merge)
+                writes_since_optimize += len(rows_to_merge)
                 batch = []
-                batch_urls = []
+                batch_frontier_urls = []
                 if resume:
-                    for merged_url in merged_urls:
-                        frontier[merged_url] = "done"
+                    done_urls = _expand_frontier_urls(
+                        merged_urls,
+                        aliases=frontier_aliases,
+                    )
+                    for done_url in done_urls:
+                        _set_frontier_alias_status(
+                            frontier=frontier,
+                            aliases=frontier_aliases,
+                            url=done_url,
+                            status="done",
+                        )
+                    await flush_frontier_batch()
                     await _merge_frontier_rows(
                         room=room,
                         table=frontier_table_name,
                         rows=[
-                            _frontier_row(url=merged_url, status="done")
-                            for merged_url in merged_urls
+                            _frontier_row(url=done_url, status="done")
+                            for done_url in done_urls
                         ],
                         namespace=namespace,
                         branch=branch,
+                        ensure=False,
                     )
+                    if create_indexes and not frontier_indexes_ready:
+                        frontier_indexes_ready = await _ensure_frontier_indexes(
+                            room=room,
+                            table=frontier_table_name,
+                            namespace=namespace,
+                            branch=branch,
+                        )
+                    writes_since_optimize += len(done_urls)
                 await _report_progress(
                     progress,
                     stage="batch_merged",
@@ -371,37 +610,70 @@ async def import_domain_with_scrapy(
                     pending_records=len(batch),
                     current_url=page.response.url,
                 )
+                await maybe_optimize(current_url=page.response.url)
         except Exception:
             logger.exception("failed to import Scrapy response %s", page.response.url)
             raise
 
     if batch:
-        merged_urls = batch_urls
+        merged_urls = _unique(batch_frontier_urls)
+        rows_to_merge = _dedupe_rows_by_primary_key(
+            rows=batch,
+            primary_key=primary_key,
+        )
         await _merge_batch(
             room=room,
             table=table,
-            rows=batch,
+            rows=rows_to_merge,
             schema=schema,
             primary_key=primary_key,
             namespace=namespace,
             branch=branch,
         )
-        imported_records += len(batch)
+        content_table_available = True
+        if create_indexes and not content_indexes_ready:
+            content_indexes_ready = await _ensure_scrapy_indexes(
+                room=room,
+                table=table,
+                primary_key=primary_key,
+                namespace=namespace,
+                branch=branch,
+            )
+        imported_records += len(rows_to_merge)
+        writes_since_optimize += len(rows_to_merge)
         batch = []
-        batch_urls = []
+        batch_frontier_urls = []
         if resume:
-            for merged_url in merged_urls:
-                frontier[merged_url] = "done"
+            done_urls = _expand_frontier_urls(
+                merged_urls,
+                aliases=frontier_aliases,
+            )
+            for done_url in done_urls:
+                _set_frontier_alias_status(
+                    frontier=frontier,
+                    aliases=frontier_aliases,
+                    url=done_url,
+                    status="done",
+                )
+            await flush_frontier_batch()
             await _merge_frontier_rows(
                 room=room,
                 table=frontier_table_name,
                 rows=[
-                    _frontier_row(url=merged_url, status="done")
-                    for merged_url in merged_urls
+                    _frontier_row(url=done_url, status="done") for done_url in done_urls
                 ],
                 namespace=namespace,
                 branch=branch,
+                ensure=False,
             )
+            if create_indexes and not frontier_indexes_ready:
+                frontier_indexes_ready = await _ensure_frontier_indexes(
+                    room=room,
+                    table=frontier_table_name,
+                    namespace=namespace,
+                    branch=branch,
+                )
+            writes_since_optimize += len(done_urls)
         await _report_progress(
             progress,
             stage="batch_merged",
@@ -411,6 +683,35 @@ async def import_domain_with_scrapy(
             pages_read=pages_read,
             pending_records=len(batch),
         )
+        await maybe_optimize()
+
+    await flush_frontier_batch()
+
+    if resume and unresolved_start_urls:
+        rows = [
+            _frontier_row(
+                url=unresolved_url,
+                status="failed",
+                error="request finished without response callback",
+            )
+            for unresolved_url in sorted(unresolved_start_urls)
+        ]
+        for row in rows:
+            _set_frontier_alias_status(
+                frontier=frontier,
+                aliases=frontier_aliases,
+                url=row["url"],
+                status="failed",
+            )
+        await _merge_frontier_rows(
+            room=room,
+            table=frontier_table_name,
+            rows=rows,
+            namespace=namespace,
+            branch=branch,
+            ensure=False,
+        )
+        failed_urls += len(rows)
 
     result = ScrapyImportResult(
         matched_records=matched_records,
@@ -474,7 +775,12 @@ async def _iter_scraped_pages(
         async def start(self) -> Any:
             for request_url in start_urls:
                 self._seen_urls.add(request_url)
-                yield Request(request_url, callback=self.parse, errback=self._errback)
+                yield Request(
+                    request_url,
+                    callback=self.parse,
+                    errback=self._errback,
+                    dont_filter=True,
+                )
 
         def parse(self, response: Response) -> Any:
             discovered_urls = []
@@ -483,17 +789,22 @@ async def _iter_scraped_pages(
                     continue
                 if not _matches_filters(link.url, filters):
                     continue
-                if link.url in self._seen_urls:
+                discovered_url = _frontier_url(link.url)
+                if discovered_url in self._seen_urls:
                     continue
-                self._seen_urls.add(link.url)
-                discovered_urls.append(link.url)
+                self._seen_urls.add(discovered_url)
+                discovered_urls.append(discovered_url)
 
             if _matches_filters(response.url, filters):
                 self._sent_pages += 1
+                request = response.request
+                request_url = response.url if request is None else request.url
                 queue.put_nowait(
                     _ScrapedPage(
                         response=response,
                         content=response.body,
+                        request_url=_frontier_url(request_url),
+                        redirect_urls=_redirect_frontier_urls(request),
                         discovered_urls=tuple(discovered_urls),
                     )
                 )
@@ -612,6 +923,122 @@ async def _ensure_frontier_table(
     )
 
 
+async def _ensure_scrapy_indexes(
+    *,
+    room: RoomClient,
+    table: str,
+    primary_key: str,
+    namespace: list[str] | None,
+    branch: str | None,
+) -> bool:
+    return await _ensure_index(
+        room=room,
+        table=table,
+        column=primary_key,
+        index_type="BTREE",
+        name=f"meshagent_scrapy_{primary_key}_btree",
+        namespace=namespace,
+        branch=branch,
+    )
+
+
+async def _ensure_frontier_indexes(
+    *,
+    room: RoomClient,
+    table: str,
+    namespace: list[str] | None,
+    branch: str | None,
+) -> bool:
+    url_index_ready = await _ensure_index(
+        room=room,
+        table=table,
+        column="url",
+        index_type="BTREE",
+        name="meshagent_scrapy_frontier_url_btree",
+        namespace=namespace,
+        branch=branch,
+    )
+    status_index_ready = await _ensure_index(
+        room=room,
+        table=table,
+        column="status",
+        index_type="BITMAP",
+        name="meshagent_scrapy_frontier_status_bitmap",
+        namespace=namespace,
+        branch=branch,
+    )
+    return url_index_ready and status_index_ready
+
+
+async def _ensure_index(
+    *,
+    room: RoomClient,
+    table: str,
+    column: str,
+    index_type: str,
+    name: str,
+    namespace: list[str] | None,
+    branch: str | None,
+) -> bool:
+    try:
+        indexes = await room.datasets.list_indexes(
+            table=table,
+            namespace=namespace,
+            branch=branch,
+        )
+        for index in indexes:
+            if index.name == name:
+                return True
+            if index.columns == [column] and index.type.upper() == index_type:
+                return True
+        await room.datasets.create_index(
+            table=table,
+            config=DatasetIndexConfig(
+                column=column,
+                index_type=index_type,  # type: ignore[arg-type]
+                name=name,
+                replace=True,
+            ),
+            namespace=namespace,
+            branch=branch,
+        )
+        return True
+    except Exception as error:
+        logger.warning(
+            "unable to create %s index %s on %s.%s",
+            index_type,
+            name,
+            "::".join(namespace or []),
+            table,
+            exc_info=error,
+        )
+        return False
+
+
+async def _optimize_tables(
+    *,
+    room: RoomClient,
+    tables: Sequence[str],
+    namespace: list[str] | None,
+    branch: str | None,
+) -> None:
+    for table in tables:
+        try:
+            await room.datasets.optimize(
+                table=table,
+                namespace=namespace,
+                branch=branch,
+                config=DatasetOptimizeConfig(),
+            )
+        except Exception as error:
+            logger.warning(
+                "unable to optimize table %s.%s",
+                "::".join(namespace or []),
+                table,
+                exc_info=error,
+            )
+
+
 async def _load_frontier(
     *,
     room: RoomClient,
@@ -619,7 +1046,25 @@ async def _load_frontier(
     namespace: list[str] | None,
     branch: str | None,
 ) -> dict[str, str]:
+    return (
+        await _load_frontier_state(
+            room=room,
+            table=table,
+            namespace=namespace,
+            branch=branch,
+        )
+    ).statuses
+
+
+async def _load_frontier_state(
+    *,
+    room: RoomClient,
+    table: str,
+    namespace: list[str] | None,
+    branch: str | None,
+) -> _FrontierState:
     frontier: dict[str, str] = {}
+    aliases: dict[str, dict[str, str]] = {}
     async for batch in room.datasets.search_stream(
         table=table,
         select=["url", "status"],
@@ -630,8 +1075,69 @@ async def _load_frontier(
             url = row["url"]
             status = row["status"]
             if isinstance(url, str) and isinstance(status, str):
-                frontier[url] = status
-    return frontier
+                frontier_url = _frontier_url(url)
+                aliases.setdefault(frontier_url, {})[url] = status
+                existing_status = frontier.get(frontier_url)
+                if existing_status is None or _frontier_status_rank(
+                    status
+                ) > _frontier_status_rank(existing_status):
+                    frontier[frontier_url] = status
+    return _FrontierState(statuses=frontier, aliases=aliases)
+
+
+async def _reconcile_frontier_aliases(
+    *,
+    room: RoomClient,
+    table: str,
+    state: _FrontierState,
+    namespace: list[str] | None,
+    branch: str | None,
+) -> None:
+    rows = []
+    for frontier_url, status in state.statuses.items():
+        if status not in {"done", "skipped"}:
+            continue
+        aliases = state.aliases.get(frontier_url, {})
+        for alias_url, alias_status in aliases.items():
+            if alias_url == frontier_url:
+                continue
+            if _frontier_status_rank(alias_status) >= _frontier_status_rank(status):
+                continue
+            rows.append(_frontier_row(url=alias_url, status=status))
+            aliases[alias_url] = status
+    await _merge_frontier_rows(
+        room=room,
+        table=table,
+        rows=rows,
+        namespace=namespace,
+        branch=branch,
+        ensure=False,
+    )
+
+
+def _expand_frontier_urls(
+    urls: Sequence[str],
+    *,
+    aliases: dict[str, dict[str, str]],
+) -> list[str]:
+    expanded = []
+    for url in urls:
+        frontier_url = _frontier_url(url)
+        expanded.append(frontier_url)
+        expanded.extend(aliases.get(frontier_url, {}))
+    return _unique(expanded)
+
+
+def _set_frontier_alias_status(
+    *,
+    frontier: dict[str, str],
+    aliases: dict[str, dict[str, str]],
+    url: str,
+    status: str,
+) -> None:
+    frontier_url = _frontier_url(url)
+    frontier[frontier_url] = status
+    aliases.setdefault(frontier_url, {})[url] = status
 
 
 async def _merge_frontier_rows(
@@ -641,15 +1147,18 @@ async def _merge_frontier_rows(
     rows: list[dict[str, Any]],
     namespace: list[str] | None,
     branch: str | None,
+    ensure: bool = True,
 ) -> None:
     if not rows:
         return
-    await _ensure_frontier_table(
-        room=room,
-        table=table,
-        namespace=namespace,
-        branch=branch,
-    )
+    rows = _dedupe_rows_by_primary_key(rows=rows, primary_key="url")
+    if ensure:
+        await _ensure_frontier_table(
+            room=room,
+            table=table,
+            namespace=namespace,
+            branch=branch,
+        )
     await room.datasets.merge(
         table=table,
         on="url",
@@ -674,6 +1183,38 @@ def _frontier_row(
         "updated_at": now,
         "source_url": source_url,
         "error": error,
+    }
+
+
+def _page_frontier_urls(page: _ScrapedPage) -> list[str]:
+    return _unique(
+        [
+            *page.redirect_urls,
+            _frontier_url(page.request_url),
+            _frontier_url(page.response.url),
+        ]
+    )
+
+
+def _redirect_frontier_urls(request: Request | None) -> tuple[str, ...]:
+    if request is None:
+        return ()
+    redirect_urls = request.meta.get("redirect_urls")
+    if not isinstance(redirect_urls, Sequence) or isinstance(redirect_urls, str):
+        return ()
+    return tuple(_frontier_url(url) for url in redirect_urls if isinstance(url, str))
+
+
+def _response_filter_document(response: Response) -> dict[str, Any]:
+    headers = {
+        name.lower(): value
+        for name, value in response.headers.to_unicode_dict().items()
+    }
+    return {
+        "url": response.url,
+        "status": response.status,
+        "headers": headers,
+        "content_type": headers.get("content-type", ""),
     }
 
 
@@ -786,6 +1327,21 @@ def _merge_schema(
     return pa.schema(list(fields_by_name.values()))
 
 
+def _dedupe_rows_by_primary_key(
+    *,
+    rows: list[dict[str, Any]],
+    primary_key: str,
+) -> list[dict[str, Any]]:
+    rows_by_key = {}
+    ordered_keys = []
+    for row in rows:
+        key = row[primary_key]
+        if key not in rows_by_key:
+            ordered_keys.append(key)
+        rows_by_key[key] = row
+    return [rows_by_key[key] for key in ordered_keys]
+
+
 def _start_url(value: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
@@ -805,6 +1361,43 @@ def _domain(value: str) -> str:
     if host == "":
         raise ValueError("domain must be non-empty")
     return host
+
+
+def _frontier_url(value: str) -> str:
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    return urlunparse(
+        (
+            scheme,
+            netloc,
+            path,
+            parsed.params,
+            parsed.query,
+            "",
+        )
+    )
+
+
+def _frontier_status_rank(status: str) -> int:
+    return {
+        "pending": 0,
+        "failed": 1,
+        "skipped": 2,
+        "done": 3,
+    }.get(status, -1)
+
+
+def _unique(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _url_filters(url_filter: str | Sequence[str] | None) -> list[str]:

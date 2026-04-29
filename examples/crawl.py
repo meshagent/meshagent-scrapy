@@ -53,9 +53,37 @@ def _parser() -> argparse.ArgumentParser:
         help="Persist and resume a crawl frontier table",
     )
     parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry URLs previously marked failed in the frontier",
+    )
+    parser.add_argument(
         "--frontier-table",
         default=None,
         help="Dataset table to use for crawl frontier state",
+    )
+    parser.add_argument(
+        "--frontier-batch-size",
+        type=int,
+        default=500,
+        help="Number of frontier updates to buffer before writing",
+    )
+    parser.add_argument(
+        "--response-filter",
+        default=None,
+        help="JMESPath expression over url, status, headers",
+    )
+    parser.add_argument(
+        "--indexes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Create scalar indexes for page and frontier tables",
+    )
+    parser.add_argument(
+        "--optimize-every",
+        type=int,
+        default=5000,
+        help="Run dataset optimize after this many writes; use 0 to disable",
     )
     parser.add_argument(
         "--user-agent",
@@ -84,7 +112,8 @@ class _ProgressReporter:
     async def __call__(self, progress: ScrapyImportProgress) -> None:
         now = time.monotonic()
         if (
-            progress.stage not in {"started", "batch_merged", "completed"}
+            progress.stage
+            not in {"started", "batch_merged", "optimizing", "optimized", "completed"}
             and now - self._last_emit < 0.25
         ):
             return
@@ -108,12 +137,17 @@ class _ProgressReporter:
     def _format(self, progress: ScrapyImportProgress) -> str:
         status = {
             "started": "starting",
+            "loading_frontier": "loading frontier",
+            "frontier_loaded": "frontier loaded",
             "frontier_discovered": "discovering",
             "page_scraped": "crawling",
+            "response_filtered": "filtered",
             "request_failed": "failed",
             "record_extracted": "extracting",
             "record_skipped": "skipping",
             "batch_merged": "merged",
+            "optimizing": "optimizing",
+            "optimized": "optimized",
             "completed": "complete",
         }.get(progress.stage, progress.stage)
         parts = [
@@ -146,11 +180,16 @@ async def _main() -> None:
                 table=args.table,
                 namespace=_namespace(args.namespace),
                 url_filter=_url_filter(args.url),
+                response_filter=args.response_filter,
                 limit=args.limit,
                 user_agent=args.user_agent,
                 respect_robots_txt=args.respect_robots_txt,
                 resume=args.resume,
+                retry_failed=args.retry_failed,
                 frontier_table=args.frontier_table,
+                frontier_batch_size=args.frontier_batch_size,
+                create_indexes=args.indexes,
+                optimize_every=args.optimize_every if args.optimize_every > 0 else None,
                 progress=reporter,
             )
     finally:
