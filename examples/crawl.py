@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import re
+import sys
+import time
+from urllib.parse import urlparse
+
+from meshagent.api import RoomClient
+from meshagent.scrapy import ScrapyImportProgress, import_domain_with_scrapy
+
+
+def _namespace(value: str | None) -> list[str] | None:
+    if value is None or value.strip() == "":
+        return None
+    return [part for part in value.split("::") if part != ""]
+
+
+def _url_filter(value: str) -> str:
+    parsed = urlparse(value)
+    host = parsed.netloc or parsed.path.split("/", maxsplit=1)[0]
+    if host == "":
+        raise ValueError("url must be non-empty")
+    path = parsed.path if parsed.netloc else parsed.path.removeprefix(host)
+    path = path.rstrip("/")
+    if path == "":
+        return f"^https?://{re.escape(host)}(/.*)?$"
+    return f"^https?://{re.escape(host)}{re.escape(path)}(/.*)?$"
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Spider a domain with Scrapy into a Meshagent room dataset.",
+    )
+    parser.add_argument("url", help="Domain or URL to crawl, e.g. https://example.com")
+    parser.add_argument("--table", default="scrapy", help="Dataset table name")
+    parser.add_argument(
+        "--namespace",
+        default=None,
+        help="Dataset namespace, using :: between nested segments",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of pages to import",
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist and resume a crawl frontier table",
+    )
+    parser.add_argument(
+        "--frontier-table",
+        default=None,
+        help="Dataset table to use for crawl frontier state",
+    )
+    parser.add_argument(
+        "--user-agent",
+        default=None,
+        help="User-Agent header Scrapy should send",
+    )
+    parser.add_argument(
+        "--respect-robots-txt",
+        action="store_true",
+        help="Ask Scrapy to obey robots.txt",
+    )
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Suppress progress output",
+    )
+    return parser
+
+
+class _ProgressReporter:
+    def __init__(self) -> None:
+        self._is_tty = sys.stderr.isatty()
+        self._last_emit = 0.0
+        self._needs_newline = False
+
+    async def __call__(self, progress: ScrapyImportProgress) -> None:
+        now = time.monotonic()
+        if (
+            progress.stage not in {"started", "batch_merged", "completed"}
+            and now - self._last_emit < 0.25
+        ):
+            return
+        self._last_emit = now
+        line = self._format(progress)
+        if self._is_tty:
+            sys.stderr.write(f"\r\033[2K{line}")
+            self._needs_newline = progress.stage != "completed"
+            if progress.stage == "completed":
+                sys.stderr.write("\n")
+        else:
+            sys.stderr.write(f"{line}\n")
+        sys.stderr.flush()
+
+    def close(self) -> None:
+        if self._needs_newline:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+            self._needs_newline = False
+
+    def _format(self, progress: ScrapyImportProgress) -> str:
+        status = {
+            "started": "starting",
+            "frontier_discovered": "discovering",
+            "page_scraped": "crawling",
+            "request_failed": "failed",
+            "record_extracted": "extracting",
+            "record_skipped": "skipping",
+            "batch_merged": "merged",
+            "completed": "complete",
+        }.get(progress.stage, progress.stage)
+        parts = [
+            f"{status}",
+            f"matched={progress.matched_records}",
+            f"imported={progress.imported_records}",
+            f"skipped={progress.skipped_records}",
+            f"pending={progress.pending_records}",
+        ]
+        if progress.current_url:
+            parts.append(_ellipsize(progress.current_url, 88))
+        return " | ".join(parts)
+
+
+def _ellipsize(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length - 1]}..."
+
+
+async def _main() -> None:
+    args = _parser().parse_args()
+    reporter = None if args.silent else _ProgressReporter()
+
+    try:
+        async with RoomClient() as room:
+            result = await import_domain_with_scrapy(
+                room,
+                url=args.url,
+                table=args.table,
+                namespace=_namespace(args.namespace),
+                url_filter=_url_filter(args.url),
+                limit=args.limit,
+                user_agent=args.user_agent,
+                respect_robots_txt=args.respect_robots_txt,
+                resume=args.resume,
+                frontier_table=args.frontier_table,
+                progress=reporter,
+            )
+    finally:
+        if reporter is not None:
+            reporter.close()
+
+    print(
+        "imported "
+        f"{result.imported_records}/{result.matched_records} records "
+        f"into {args.namespace + '::' if args.namespace else ''}{args.table} "
+        f"({result.skipped_records} skipped, "
+        f"{result.discovered_urls} discovered, {result.failed_urls} failed)"
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

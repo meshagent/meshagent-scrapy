@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include meshagent *.pyi
+recursive-include meshagent py.typed
