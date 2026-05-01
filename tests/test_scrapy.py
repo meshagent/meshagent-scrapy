@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+import asyncio
 from typing import Any
 
 import pyarrow as pa
 import pytest
 
+from meshagent.api import RoomException
 from meshagent.scrapy import scrapy
-from meshagent.scrapy.scrapy import ScrapyImportProgress, _ScrapedPage
+from meshagent.scrapy.scrapy import ScrapyImportProgress, _ScrapedFailure, _ScrapedPage
 
 
 class _Headers:
@@ -75,6 +77,7 @@ class _FakeDatasets:
         self.list_indexes_calls: list[dict[str, Any]] = []
         self.create_index_calls: list[dict[str, Any]] = []
         self.optimize_calls: list[dict[str, Any]] = []
+        self.raise_existing_schema_conflict = False
 
     async def create_table_with_schema(
         self,
@@ -94,6 +97,11 @@ class _FakeDatasets:
                 "branch": branch,
             }
         )
+        if self.raise_existing_schema_conflict and name in self.schemas:
+            raise RoomException(
+                f"Error creating table '{name}': Table '{name}' already exists "
+                "with a different schema"
+            )
         self.schemas.setdefault(name, schema)
 
     async def inspect(
@@ -262,6 +270,28 @@ async def _fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
         ),  # type: ignore[arg-type]
         content=b"Plain B",
         request_url="https://example.com/b",
+    )
+
+
+async def _fake_scraped_pages_with_binary(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+    del kwargs
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/a",
+            content_type="text/html; charset=utf-8",
+            body=b"<html><body>Hello</body></html>",
+        ),  # type: ignore[arg-type]
+        content=b"<html><body>Hello</body></html>",
+        request_url="https://example.com/a",
+    )
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/file.step",
+            content_type="application/octet-stream",
+            body=b"\x00binary",
+        ),  # type: ignore[arg-type]
+        content=b"\x00binary",
+        request_url="https://example.com/file.step",
     )
 
 
@@ -651,6 +681,53 @@ async def test_import_domain_rejects_unknown_clean(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_import_domain_rejects_non_positive_concurrency(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    with pytest.raises(ValueError, match="concurrency"):
+        await scrapy.import_domain_with_scrapy(
+            room,  # type: ignore[arg-type]
+            url="https://example.com",
+            concurrency=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_domain_rejects_non_positive_max_batch_bytes(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    with pytest.raises(ValueError, match="max_batch_bytes"):
+        await scrapy.import_domain_with_scrapy(
+            room,  # type: ignore[arg-type]
+            url="https://example.com",
+            max_batch_bytes=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_domain_passes_concurrency_to_scrapy(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+        captured.update(kwargs)
+        if False:
+            yield
+
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        concurrency=5,
+    )
+
+    assert captured["concurrency"] == 5
+
+
+@pytest.mark.asyncio
 async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) -> None:
     monkeypatch.setattr(
         scrapy, "_iter_scraped_pages", _fake_duplicate_primary_key_pages
@@ -678,6 +755,25 @@ async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) ->
             "image_urls": [],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_flushes_content_batch_by_estimated_bytes(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=100,
+        max_batch_bytes=1,
+        clean="none",
+    )
+
+    assert result.imported_records == 2
+    assert [call["records"].num_rows for call in room.datasets.merge_calls] == [1, 1]
 
 
 @pytest.mark.asyncio
@@ -758,6 +854,45 @@ async def test_response_filter_skips_non_matching_responses(monkeypatch) -> None
         }
     ]
     assert "response_filtered" in [update.stage for update in updates]
+
+
+@pytest.mark.asyncio
+async def test_default_response_filter_skips_binary_responses(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages_with_binary)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        clean="none",
+    )
+
+    assert result.matched_records == 2
+    assert result.imported_records == 1
+    assert result.skipped_records == 1
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["url"] == (
+        "https://example.com/a"
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_response_filter_replaces_default_text_filter(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages_with_binary)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        response_filter="contains(url, '.step')",
+        clean="none",
+    )
+
+    assert result.matched_records == 2
+    assert result.imported_records == 1
+    assert result.skipped_records == 1
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["url"] == (
+        "https://example.com/file.step"
+    )
 
 
 @pytest.mark.asyncio
@@ -931,6 +1066,233 @@ async def test_resume_reconciles_done_aliases_before_crawling(monkeypatch) -> No
     }
     assert frontier_rows["https://example.com/page"] == "done"
     assert frontier_rows["https://example.com/page#main-content"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_resume_filters_retry_urls_to_current_crawl_filter(monkeypatch) -> None:
+    captured_start_urls: list[str] = []
+
+    async def fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+        captured_start_urls.extend(kwargs["start_urls"])
+        if False:
+            yield
+
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+    room.datasets.search_rows["pages__frontier"] = [
+        {"url": "https://www.pfiserfaucets.com/", "status": "failed"},
+        {"url": "https://www.pfisterfaucets.com/", "status": "failed"},
+    ]
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://www.pfisterfaucets.com/",
+        table="pages",
+        url_filter=r"^https?://www\.pfisterfaucets\.com(/.*)?$",
+        resume=True,
+        retry_failed=True,
+    )
+
+    assert captured_start_urls == ["https://www.pfisterfaucets.com/"]
+
+
+@pytest.mark.asyncio
+async def test_scrapy_request_defaults_do_not_send_accept_language(monkeypatch) -> None:
+    captured_settings: dict[str, Any] = {}
+
+    class FakeRunner:
+        def __init__(self, settings: dict[str, Any]) -> None:
+            captured_settings["runner"] = settings
+
+        def crawl(self, spider_cls: Any) -> asyncio.Future[None]:
+            captured_settings["spider"] = spider_cls.custom_settings
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(None)
+            return future
+
+    monkeypatch.setattr(scrapy, "AsyncCrawlerRunner", FakeRunner)
+
+    events = [
+        event
+        async for event in scrapy._iter_scraped_pages(
+            start_urls=["https://example.com/"],
+            domain=None,
+            url_filter=None,
+            limit=1,
+            concurrency=None,
+            user_agent=None,
+            respect_robots_txt=False,
+            known_urls=set(),
+        )
+    ]
+
+    assert events == []
+    headers = captured_settings["spider"]["DEFAULT_REQUEST_HEADERS"]
+    assert (
+        headers["Accept"]
+        == "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    )
+    assert "Accept-Language" not in headers
+    assert captured_settings["spider"]["USER_AGENT"].startswith("Mozilla/5.0")
+
+
+@pytest.mark.asyncio
+async def test_scrapy_user_agent_override_sets_scrapy_user_agent(monkeypatch) -> None:
+    captured_settings: dict[str, Any] = {}
+
+    class FakeRunner:
+        def __init__(self, settings: dict[str, Any]) -> None:
+            captured_settings["runner"] = settings
+
+        def crawl(self, spider_cls: Any) -> asyncio.Future[None]:
+            captured_settings["spider"] = spider_cls.custom_settings
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(None)
+            return future
+
+    monkeypatch.setattr(scrapy, "AsyncCrawlerRunner", FakeRunner)
+
+    events = [
+        event
+        async for event in scrapy._iter_scraped_pages(
+            start_urls=["https://example.com/"],
+            domain=None,
+            url_filter=None,
+            limit=1,
+            concurrency=None,
+            user_agent="meshagent-test",
+            respect_robots_txt=False,
+            known_urls=set(),
+        )
+    ]
+
+    assert events == []
+    assert captured_settings["spider"]["USER_AGENT"] == "meshagent-test"
+
+
+@pytest.mark.asyncio
+async def test_scrapy_concurrency_sets_scrapy_concurrent_requests(monkeypatch) -> None:
+    captured_settings: dict[str, Any] = {}
+
+    class FakeRunner:
+        def __init__(self, settings: dict[str, Any]) -> None:
+            captured_settings["runner"] = settings
+
+        def crawl(self, spider_cls: Any) -> asyncio.Future[None]:
+            captured_settings["spider"] = spider_cls.custom_settings
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(None)
+            return future
+
+    monkeypatch.setattr(scrapy, "AsyncCrawlerRunner", FakeRunner)
+
+    events = [
+        event
+        async for event in scrapy._iter_scraped_pages(
+            start_urls=["https://example.com/"],
+            domain=None,
+            url_filter=None,
+            limit=1,
+            concurrency=5,
+            user_agent=None,
+            respect_robots_txt=False,
+            known_urls=set(),
+        )
+    ]
+
+    assert events == []
+    assert captured_settings["spider"]["CONCURRENT_REQUESTS"] == 5
+
+
+@pytest.mark.asyncio
+async def test_resume_records_frontier_failure_details(monkeypatch) -> None:
+    async def fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedFailure]:
+        del kwargs
+        yield _ScrapedFailure(
+            url="https://example.com/",
+            error="HTTP 403",
+            failure_type="http_status",
+            http_status=403,
+            final_url="https://example.com/",
+            content_type="text/html; charset=utf-8",
+        )
+
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com/",
+        table="pages",
+        resume=True,
+    )
+
+    assert result.failed_urls == 1
+    frontier_row = room.datasets.search_rows["pages__frontier"][0]
+    assert frontier_row["status"] == "failed"
+    assert frontier_row["error"] == "HTTP 403"
+    assert frontier_row["failure_type"] == "http_status"
+    assert frontier_row["http_status"] == 403
+    assert frontier_row["final_url"] == "https://example.com/"
+    assert frontier_row["content_type"] == "text/html; charset=utf-8"
+
+
+@pytest.mark.asyncio
+async def test_resume_records_unresolved_frontier_failure_type(monkeypatch) -> None:
+    async def fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+        del kwargs
+        if False:
+            yield
+
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com/",
+        table="pages",
+        resume=True,
+    )
+
+    assert result.failed_urls == 1
+    frontier_row = room.datasets.search_rows["pages__frontier"][0]
+    assert frontier_row["status"] == "failed"
+    assert frontier_row["error"] == "request finished without response callback"
+    assert frontier_row["failure_type"] == "crawler_no_callback"
+
+
+@pytest.mark.asyncio
+async def test_ensure_frontier_table_adds_columns_after_existing_schema_conflict() -> (
+    None
+):
+    datasets = _FakeDatasets()
+    datasets.schemas["pages__frontier"] = pa.schema(
+        [
+            pa.field("url", pa.string(), nullable=False),
+            pa.field("status", pa.string(), nullable=False),
+            pa.field("discovered_at", pa.string()),
+            pa.field("updated_at", pa.string()),
+            pa.field("source_url", pa.string()),
+            pa.field("error", pa.string()),
+        ]
+    )
+    datasets.raise_existing_schema_conflict = True
+    room = _FakeRoom(datasets=datasets)
+
+    await scrapy._ensure_frontier_table(
+        room=room,  # type: ignore[arg-type]
+        table="pages__frontier",
+        namespace=None,
+        branch=None,
+    )
+
+    assert set(datasets.add_columns_calls[0]["new_columns"]) == {
+        "failure_type",
+        "http_status",
+        "final_url",
+        "content_type",
+    }
+    assert "failure_type" in datasets.schemas["pages__frontier"].names
 
 
 @pytest.mark.asyncio

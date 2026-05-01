@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 from meshagent.api import RoomClient
 from meshagent.scrapy import ScrapyImportProgress, import_domain_with_scrapy
 
+_DEFAULT_BATCH_SIZE = 5000
+_DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
+
 
 def _namespace(value: str | None) -> list[str] | None:
     if value is None or value.strip() == "":
@@ -47,6 +50,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Maximum number of pages to import",
     )
     parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent Scrapy requests; uses Scrapy's default when omitted",
+    )
+    parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -67,6 +76,24 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Number of frontier updates to buffer before writing",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            f"Maximum page records to merge per content batch; defaults to "
+            f"{_DEFAULT_BATCH_SIZE}"
+        ),
+    )
+    parser.add_argument(
+        "--max-batch-bytes",
+        type=int,
+        default=_DEFAULT_MAX_BATCH_BYTES,
+        help=(
+            "Estimated maximum content batch bytes before merging; "
+            f"defaults to {_DEFAULT_MAX_BATCH_BYTES}; use 0 to disable"
+        ),
     )
     parser.add_argument(
         "--response-filter",
@@ -196,6 +223,15 @@ async def _main() -> None:
                 content_format=args.format,
                 clean=args.clean,
                 limit=args.limit,
+                concurrency=args.concurrency,
+                batch_size=(
+                    args.batch_size
+                    if args.batch_size is not None
+                    else _DEFAULT_BATCH_SIZE
+                ),
+                max_batch_bytes=(
+                    args.max_batch_bytes if args.max_batch_bytes > 0 else None
+                ),
                 user_agent=args.user_agent,
                 respect_robots_txt=args.respect_robots_txt,
                 resume=args.resume,

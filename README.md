@@ -12,6 +12,7 @@ result = await import_domain_with_scrapy(
     table="pages",
     namespace=["crawls"],
     limit=100,
+    concurrency=5,
 )
 ```
 
@@ -20,12 +21,26 @@ To test it through `meshagent room connect`:
 ```bash
 meshagent room connect --room=my-room --identity=scrapy -- \
   python meshagent-sdk/meshagent-scrapy/examples/crawl.py \
-  https://www.meshagent.com --table=sample --namespace=crawls --limit=100
+  https://www.meshagent.com --table=sample --namespace=crawls --limit=100 --concurrency=5
 ```
 
 The sample command writes progress to stderr while it imports. TTY output uses a
 single updating line; redirected output uses plain log lines. Pass `--silent` to
 suppress progress output.
+
+Pass `--concurrency` or `concurrency=` to tune Scrapy's maximum concurrent
+requests.
+
+Pass `--batch-size` or `batch_size=` to cap how many page records are merged
+into the content table at once. The crawler also flushes content batches by
+estimated payload size with `--max-batch-bytes` or `max_batch_bytes=`, which
+defaults to 16 MiB; the row-count cap defaults to 5000. Raw HTML rows can be
+large, so prefer lowering the byte limit before lowering the row count if the
+room server reports Lance/DataFusion merge memory exhaustion while importing
+full HTML pages.
+
+The crawler sends a browser-like User-Agent by default. Pass `--user-agent` or
+`user_agent=` to override it for a specific crawl.
 
 The default extractor writes page content as markdown in the `text` column. Use
 `--format=html` to keep HTML, `--format=text` to strip markup to plain text, or
@@ -61,9 +76,11 @@ optimization periodically while importing and shows `optimizing`/`optimized` in
 progress output. Tune that with `--optimize-every` or `optimize_every=`, and use
 `0` on the CLI or `None` in library code to disable automatic optimization.
 
-Pass `--response-filter` or `response_filter=` to skip responses with a JMESPath
-expression over `url`, `status`, `headers`, and `content_type`. Header names are
-lower-cased, so an HTML-only crawl can use:
+By default, the crawler imports textual responses only, based on `Content-Type`
+values containing `text/`, `html`, `xml`, or `json`. Pass `--response-filter`
+or `response_filter=` to replace that default with a JMESPath expression over
+`url`, `status`, `headers`, `content_type`, and `content_type_lower`. Header
+names are lower-cased, so an HTML-only crawl can use:
 
 ```bash
 --response-filter "contains(headers.\"content-type\", 'text/html')"

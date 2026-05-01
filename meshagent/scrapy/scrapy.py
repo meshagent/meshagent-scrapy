@@ -16,7 +16,12 @@ import jmespath
 import pyarrow as pa
 from trafilatura import extract as trafilatura_extract
 
-from meshagent.api import DatasetIndexConfig, DatasetOptimizeConfig, RoomClient
+from meshagent.api import (
+    DatasetIndexConfig,
+    DatasetOptimizeConfig,
+    RoomClient,
+    RoomException,
+)
 
 from scrapy import Request, Spider
 from scrapy.crawler import AsyncCrawlerRunner
@@ -25,6 +30,20 @@ from scrapy.http import Response
 from scrapy.linkextractors import LinkExtractor
 
 logger = logging.getLogger(__name__)
+_FAILURE_HTTP_STATUS_CODES = tuple(range(400, 600))
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+_DEFAULT_TEXT_RESPONSE_FILTER = (
+    "contains(content_type_lower, 'text/') || "
+    "contains(content_type_lower, 'html') || "
+    "contains(content_type_lower, 'xml') || "
+    "contains(content_type_lower, 'json')"
+)
+_DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
+_DEFAULT_BATCH_SIZE = 5000
 
 warnings.filterwarnings(
     "ignore",
@@ -82,6 +101,10 @@ class _ScrapedPage:
 class _ScrapedFailure:
     url: str
     error: str
+    failure_type: str | None = None
+    http_status: int | None = None
+    final_url: str | None = None
+    content_type: str | None = None
 
 
 _ScrapedEvent: TypeAlias = _ScrapedPage | _ScrapedFailure
@@ -211,7 +234,9 @@ async def import_domain_with_scrapy(
     namespace: list[str] | None = None,
     branch: str | None = None,
     limit: int | None = None,
-    batch_size: int = 100,
+    concurrency: int | None = None,
+    batch_size: int = _DEFAULT_BATCH_SIZE,
+    max_batch_bytes: int | None = _DEFAULT_MAX_BATCH_BYTES,
     frontier_batch_size: int = 500,
     user_agent: str | None = None,
     respect_robots_txt: bool = False,
@@ -232,12 +257,16 @@ async def import_domain_with_scrapy(
 
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than zero")
+    if max_batch_bytes is not None and max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be greater than zero or None")
     if frontier_batch_size <= 0:
         raise ValueError("frontier_batch_size must be greater than zero")
     if primary_key == "":
         raise ValueError("primary_key must be non-empty")
     if limit is not None and limit < 0:
         raise ValueError("limit must be greater than or equal to zero")
+    if concurrency is not None and concurrency <= 0:
+        raise ValueError("concurrency must be greater than zero")
     if optimize_every is not None and optimize_every <= 0:
         raise ValueError("optimize_every must be greater than zero or None")
     if content_format not in {"md", "html", "text"}:
@@ -249,8 +278,8 @@ async def import_domain_with_scrapy(
         content_format=content_format,
         clean=clean,
     )
-    response_filter_expression = (
-        jmespath.compile(response_filter) if response_filter is not None else None
+    response_filter_expression = jmespath.compile(
+        response_filter or _DEFAULT_TEXT_RESPONSE_FILTER
     )
     schema = schema or (_default_schema() if extract is None else None)
     frontier_table_name = frontier_table or f"{table}__frontier"
@@ -334,10 +363,12 @@ async def import_domain_with_scrapy(
                     namespace=namespace,
                     branch=branch,
                 )
+        resume_filters = _compiled_url_filters(url_filter)
         start_urls = [
             pending_url
             for pending_url, status in frontier.items()
             if status == "pending" or (retry_failed and status == "failed")
+            if _matches_filters(pending_url, resume_filters)
         ]
         if limit is not None:
             start_urls = start_urls[:limit]
@@ -359,6 +390,7 @@ async def import_domain_with_scrapy(
     failed_urls = 0
     batch: list[dict[str, Any]] = []
     batch_frontier_urls: list[str] = []
+    batch_estimated_bytes = 0
     frontier_batch: list[dict[str, Any]] = []
     unresolved_start_urls = set(start_urls) if resume else set()
     writes_since_optimize = 0
@@ -432,6 +464,91 @@ async def import_domain_with_scrapy(
         if len(frontier_batch) >= frontier_batch_size:
             await flush_frontier_batch()
 
+    async def flush_content_batch(current_url: str | None = None) -> None:
+        nonlocal batch
+        nonlocal batch_estimated_bytes
+        nonlocal batch_frontier_urls
+        nonlocal content_indexes_ready
+        nonlocal content_table_available
+        nonlocal frontier_indexes_ready
+        nonlocal imported_records
+        nonlocal schema
+        nonlocal writes_since_optimize
+        if not batch:
+            return
+
+        merged_urls = _unique(batch_frontier_urls)
+        rows_to_merge = _dedupe_rows_by_primary_key(
+            rows=batch,
+            primary_key=primary_key,
+        )
+        schema = await _merge_batch(
+            room=room,
+            table=table,
+            rows=rows_to_merge,
+            schema=schema,
+            primary_key=primary_key,
+            namespace=namespace,
+            branch=branch,
+        )
+        content_table_available = True
+        if create_indexes and not content_indexes_ready:
+            content_indexes_ready = await _ensure_scrapy_indexes(
+                room=room,
+                table=table,
+                primary_key=primary_key,
+                schema=schema,
+                namespace=namespace,
+                branch=branch,
+            )
+        imported_records += len(rows_to_merge)
+        writes_since_optimize += len(rows_to_merge)
+        batch = []
+        batch_frontier_urls = []
+        batch_estimated_bytes = 0
+        if resume:
+            done_urls = _expand_frontier_urls(
+                merged_urls,
+                aliases=frontier_aliases,
+            )
+            for done_url in done_urls:
+                _set_frontier_alias_status(
+                    frontier=frontier,
+                    aliases=frontier_aliases,
+                    url=done_url,
+                    status="done",
+                )
+            await flush_frontier_batch()
+            await _merge_frontier_rows(
+                room=room,
+                table=frontier_table_name,
+                rows=[
+                    _frontier_row(url=done_url, status="done") for done_url in done_urls
+                ],
+                namespace=namespace,
+                branch=branch,
+                ensure=False,
+            )
+            if create_indexes and not frontier_indexes_ready:
+                frontier_indexes_ready = await _ensure_frontier_indexes(
+                    room=room,
+                    table=frontier_table_name,
+                    namespace=namespace,
+                    branch=branch,
+                )
+            writes_since_optimize += len(done_urls)
+        await _report_progress(
+            progress,
+            stage="batch_merged",
+            matched_records=matched_records,
+            imported_records=imported_records,
+            skipped_records=skipped_records,
+            pages_read=pages_read,
+            pending_records=len(batch),
+            current_url=current_url,
+        )
+        await maybe_optimize(current_url=current_url)
+
     def resolve_start_urls(urls: Sequence[str]) -> None:
         for resolved_url in urls:
             unresolved_start_urls.discard(_frontier_url(resolved_url))
@@ -451,6 +568,7 @@ async def import_domain_with_scrapy(
         domain=domain,
         url_filter=url_filter,
         limit=limit,
+        concurrency=concurrency,
         user_agent=user_agent,
         respect_robots_txt=respect_robots_txt,
         known_urls=set(frontier) if resume else set(),
@@ -476,6 +594,10 @@ async def import_domain_with_scrapy(
                             url=failed_frontier_url,
                             status="failed",
                             error=event.error,
+                            failure_type=event.failure_type,
+                            http_status=event.http_status,
+                            final_url=event.final_url,
+                            content_type=event.content_type,
                         )
                         for failed_frontier_url in failed_frontier_urls
                     ]
@@ -619,8 +741,16 @@ async def import_domain_with_scrapy(
                 raise ValueError(
                     f"extract callback must return primary key column {primary_key!r}"
                 )
+            row_estimated_bytes = _estimated_record_bytes(row)
+            if (
+                max_batch_bytes is not None
+                and batch
+                and batch_estimated_bytes + row_estimated_bytes > max_batch_bytes
+            ):
+                await flush_content_batch(current_url=page.response.url)
             batch.append(row)
             batch_frontier_urls.extend(_page_frontier_urls(page))
+            batch_estimated_bytes += row_estimated_bytes
             await _report_progress(
                 progress,
                 stage="record_extracted",
@@ -632,151 +762,12 @@ async def import_domain_with_scrapy(
                 current_url=page.response.url,
             )
             if len(batch) >= batch_size:
-                merged_urls = _unique(batch_frontier_urls)
-                rows_to_merge = _dedupe_rows_by_primary_key(
-                    rows=batch,
-                    primary_key=primary_key,
-                )
-                schema = await _merge_batch(
-                    room=room,
-                    table=table,
-                    rows=rows_to_merge,
-                    schema=schema,
-                    primary_key=primary_key,
-                    namespace=namespace,
-                    branch=branch,
-                )
-                content_table_available = True
-                if create_indexes and not content_indexes_ready:
-                    content_indexes_ready = await _ensure_scrapy_indexes(
-                        room=room,
-                        table=table,
-                        primary_key=primary_key,
-                        schema=schema,
-                        namespace=namespace,
-                        branch=branch,
-                    )
-                imported_records += len(rows_to_merge)
-                writes_since_optimize += len(rows_to_merge)
-                batch = []
-                batch_frontier_urls = []
-                if resume:
-                    done_urls = _expand_frontier_urls(
-                        merged_urls,
-                        aliases=frontier_aliases,
-                    )
-                    for done_url in done_urls:
-                        _set_frontier_alias_status(
-                            frontier=frontier,
-                            aliases=frontier_aliases,
-                            url=done_url,
-                            status="done",
-                        )
-                    await flush_frontier_batch()
-                    await _merge_frontier_rows(
-                        room=room,
-                        table=frontier_table_name,
-                        rows=[
-                            _frontier_row(url=done_url, status="done")
-                            for done_url in done_urls
-                        ],
-                        namespace=namespace,
-                        branch=branch,
-                        ensure=False,
-                    )
-                    if create_indexes and not frontier_indexes_ready:
-                        frontier_indexes_ready = await _ensure_frontier_indexes(
-                            room=room,
-                            table=frontier_table_name,
-                            namespace=namespace,
-                            branch=branch,
-                        )
-                    writes_since_optimize += len(done_urls)
-                await _report_progress(
-                    progress,
-                    stage="batch_merged",
-                    matched_records=matched_records,
-                    imported_records=imported_records,
-                    skipped_records=skipped_records,
-                    pages_read=pages_read,
-                    pending_records=len(batch),
-                    current_url=page.response.url,
-                )
-                await maybe_optimize(current_url=page.response.url)
+                await flush_content_batch(current_url=page.response.url)
         except Exception:
             logger.exception("failed to import Scrapy response %s", page.response.url)
             raise
 
-    if batch:
-        merged_urls = _unique(batch_frontier_urls)
-        rows_to_merge = _dedupe_rows_by_primary_key(
-            rows=batch,
-            primary_key=primary_key,
-        )
-        await _merge_batch(
-            room=room,
-            table=table,
-            rows=rows_to_merge,
-            schema=schema,
-            primary_key=primary_key,
-            namespace=namespace,
-            branch=branch,
-        )
-        content_table_available = True
-        if create_indexes and not content_indexes_ready:
-            content_indexes_ready = await _ensure_scrapy_indexes(
-                room=room,
-                table=table,
-                primary_key=primary_key,
-                schema=schema,
-                namespace=namespace,
-                branch=branch,
-            )
-        imported_records += len(rows_to_merge)
-        writes_since_optimize += len(rows_to_merge)
-        batch = []
-        batch_frontier_urls = []
-        if resume:
-            done_urls = _expand_frontier_urls(
-                merged_urls,
-                aliases=frontier_aliases,
-            )
-            for done_url in done_urls:
-                _set_frontier_alias_status(
-                    frontier=frontier,
-                    aliases=frontier_aliases,
-                    url=done_url,
-                    status="done",
-                )
-            await flush_frontier_batch()
-            await _merge_frontier_rows(
-                room=room,
-                table=frontier_table_name,
-                rows=[
-                    _frontier_row(url=done_url, status="done") for done_url in done_urls
-                ],
-                namespace=namespace,
-                branch=branch,
-                ensure=False,
-            )
-            if create_indexes and not frontier_indexes_ready:
-                frontier_indexes_ready = await _ensure_frontier_indexes(
-                    room=room,
-                    table=frontier_table_name,
-                    namespace=namespace,
-                    branch=branch,
-                )
-            writes_since_optimize += len(done_urls)
-        await _report_progress(
-            progress,
-            stage="batch_merged",
-            matched_records=matched_records,
-            imported_records=imported_records,
-            skipped_records=skipped_records,
-            pages_read=pages_read,
-            pending_records=len(batch),
-        )
-        await maybe_optimize()
+    await flush_content_batch()
 
     await flush_frontier_batch()
 
@@ -786,6 +777,7 @@ async def import_domain_with_scrapy(
                 url=unresolved_url,
                 status="failed",
                 error="request finished without response callback",
+                failure_type="crawler_no_callback",
             )
             for unresolved_url in sorted(unresolved_start_urls)
         ]
@@ -835,6 +827,7 @@ async def _iter_scraped_pages(
     domain: str | None,
     url_filter: str | Sequence[str] | None,
     limit: int | None,
+    concurrency: int | None,
     user_agent: str | None,
     respect_robots_txt: bool,
     known_urls: set[str],
@@ -847,12 +840,16 @@ async def _iter_scraped_pages(
     filters = _compiled_url_filters(url_filter)
     queue: asyncio.Queue[_ScrapedEvent | None] = asyncio.Queue()
     spider_settings: dict[str, Any] = {
+        "DEFAULT_REQUEST_HEADERS": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
         "LOG_ENABLED": False,
         "ROBOTSTXT_OBEY": respect_robots_txt,
         "TELNETCONSOLE_ENABLED": False,
+        "USER_AGENT": user_agent or _DEFAULT_USER_AGENT,
     }
-    if user_agent is not None:
-        spider_settings["USER_AGENT"] = user_agent
+    if concurrency is not None:
+        spider_settings["CONCURRENT_REQUESTS"] = concurrency
 
     class _MeshagentSpider(Spider):
         name = "meshagent_scrapy_domain"
@@ -873,9 +870,24 @@ async def _iter_scraped_pages(
                     callback=self.parse,
                     errback=self._errback,
                     dont_filter=True,
+                    meta={"handle_httpstatus_list": _FAILURE_HTTP_STATUS_CODES},
                 )
 
         def parse(self, response: Response) -> Any:
+            if response.status >= 400:
+                headers = _response_headers(response)
+                queue.put_nowait(
+                    _ScrapedFailure(
+                        url=response.url,
+                        error=f"HTTP {response.status}",
+                        failure_type="http_status",
+                        http_status=response.status,
+                        final_url=response.url,
+                        content_type=headers.get("content-type"),
+                    )
+                )
+                return
+
             discovered_urls = []
             for link in self._link_extractor.extract_links(response):
                 if _domain(link.url) != allowed_domain:
@@ -909,14 +921,17 @@ async def _iter_scraped_pages(
                     discovered_url,
                     callback=self.parse,
                     errback=self._errback,
+                    meta={"handle_httpstatus_list": _FAILURE_HTTP_STATUS_CODES},
                 )
 
         def _errback(self, failure: Any) -> None:
             request = failure.request
+            value = failure.value
             queue.put_nowait(
                 _ScrapedFailure(
                     url=request.url,
-                    error=str(failure.value),
+                    error=str(value),
+                    failure_type=type(value).__name__,
                 )
             )
 
@@ -975,13 +990,17 @@ async def _ensure_table(
     namespace: list[str] | None,
     branch: str | None,
 ) -> None:
-    await room.datasets.create_table_with_schema(
-        name=table,
-        schema=schema,
-        mode="create_if_not_exists",
-        namespace=namespace,
-        branch=branch,
-    )
+    try:
+        await room.datasets.create_table_with_schema(
+            name=table,
+            schema=schema,
+            mode="create_if_not_exists",
+            namespace=namespace,
+            branch=branch,
+        )
+    except RoomException as exc:
+        if not _is_existing_table_schema_conflict(table=table, error=exc):
+            raise
     existing_schema = await room.datasets.inspect(
         table=table,
         namespace=namespace,
@@ -998,6 +1017,14 @@ async def _ensure_table(
             namespace=namespace,
             branch=branch,
         )
+
+
+def _is_existing_table_schema_conflict(*, table: str, error: RoomException) -> bool:
+    message = str(error)
+    return (
+        f"Table '{table}' already exists with a different schema" in message
+        or f"Class `{table}` already exists with a different schema" in message
+    )
 
 
 async def _ensure_frontier_table(
@@ -1301,6 +1328,10 @@ def _frontier_row(
     status: str,
     source_url: str | None = None,
     error: str | None = None,
+    failure_type: str | None = None,
+    http_status: int | None = None,
+    final_url: str | None = None,
+    content_type: str | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return {
@@ -1310,6 +1341,10 @@ def _frontier_row(
         "updated_at": now,
         "source_url": source_url,
         "error": error,
+        "failure_type": failure_type,
+        "http_status": http_status,
+        "final_url": final_url,
+        "content_type": content_type,
     }
 
 
@@ -1333,15 +1368,21 @@ def _redirect_frontier_urls(request: Request | None) -> tuple[str, ...]:
 
 
 def _response_filter_document(response: Response) -> dict[str, Any]:
-    headers = {
-        name.lower(): value
-        for name, value in response.headers.to_unicode_dict().items()
-    }
+    headers = _response_headers(response)
+    content_type = headers.get("content-type", "")
     return {
         "url": response.url,
         "status": response.status,
         "headers": headers,
-        "content_type": headers.get("content-type", ""),
+        "content_type": content_type,
+        "content_type_lower": content_type.lower(),
+    }
+
+
+def _response_headers(response: Response) -> dict[str, str]:
+    return {
+        name.lower(): value
+        for name, value in response.headers.to_unicode_dict().items()
     }
 
 
@@ -1354,6 +1395,10 @@ def _frontier_schema() -> pa.Schema:
             pa.field("updated_at", pa.string()),
             pa.field("source_url", pa.string()),
             pa.field("error", pa.string()),
+            pa.field("failure_type", pa.string()),
+            pa.field("http_status", pa.int64()),
+            pa.field("final_url", pa.string()),
+            pa.field("content_type", pa.string()),
         ]
     )
 
@@ -1548,6 +1593,27 @@ def _record_urls(records: Sequence[Mapping[str, Any]]) -> list[str]:
         if isinstance(value, str) and value != "":
             urls.append(value)
     return _unique(urls)
+
+
+def _estimated_record_bytes(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, bool):
+        return 1
+    if isinstance(value, int | float):
+        return 8
+    if isinstance(value, Mapping):
+        return sum(
+            _estimated_record_bytes(key) + _estimated_record_bytes(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return sum(_estimated_record_bytes(item) for item in value)
+    return len(str(value).encode("utf-8"))
 
 
 def _attribute_list(attrs: Sequence[tuple[str, str | None]]) -> list[dict[str, str]]:
