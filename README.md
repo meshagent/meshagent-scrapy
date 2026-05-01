@@ -34,10 +34,11 @@ requests.
 Pass `--batch-size` or `batch_size=` to cap how many page records are merged
 into the content table at once. The crawler also flushes content batches by
 estimated payload size with `--max-batch-bytes` or `max_batch_bytes=`, which
-defaults to 16 MiB; the row-count cap defaults to 5000. Raw HTML rows can be
-large, so prefer lowering the byte limit before lowering the row count if the
-room server reports Lance/DataFusion merge memory exhaustion while importing
-full HTML pages.
+defaults to 16 MiB, and by elapsed time with `--max-batch-delay` or
+`max_batch_delay=`, which defaults to 5 minutes. The row-count cap defaults to
+1000. Raw HTML rows can be large, so prefer lowering the byte limit before
+lowering the row count if the room server reports Lance/DataFusion merge memory
+exhaustion while importing full HTML pages.
 
 The crawler sends a browser-like User-Agent by default. Pass `--user-agent` or
 `user_agent=` to override it for a specific crawl.

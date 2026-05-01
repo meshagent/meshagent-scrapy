@@ -8,10 +8,12 @@ import time
 from urllib.parse import urlparse
 
 from meshagent.api import RoomClient
+from meshagent.api.http import new_client_session
 from meshagent.scrapy import ScrapyImportProgress, import_domain_with_scrapy
 
-_DEFAULT_BATCH_SIZE = 5000
+_DEFAULT_BATCH_SIZE = 1000
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
+_DEFAULT_MAX_BATCH_DELAY = 5 * 60
 
 
 def _namespace(value: str | None) -> list[str] | None:
@@ -93,6 +95,15 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Estimated maximum content batch bytes before merging; "
             f"defaults to {_DEFAULT_MAX_BATCH_BYTES}; use 0 to disable"
+        ),
+    )
+    parser.add_argument(
+        "--max-batch-delay",
+        type=float,
+        default=_DEFAULT_MAX_BATCH_DELAY,
+        help=(
+            "Maximum seconds to buffer pending content rows before merging; "
+            f"defaults to {_DEFAULT_MAX_BATCH_DELAY:g}; use 0 to disable"
         ),
     )
     parser.add_argument(
@@ -212,36 +223,42 @@ async def _main() -> None:
     reporter = None if args.silent else _ProgressReporter()
 
     try:
-        async with RoomClient() as room:
-            result = await import_domain_with_scrapy(
-                room,
-                url=args.url,
-                table=args.table,
-                namespace=_namespace(args.namespace),
-                url_filter=_url_filter(args.url),
-                response_filter=args.response_filter,
-                content_format=args.format,
-                clean=args.clean,
-                limit=args.limit,
-                concurrency=args.concurrency,
-                batch_size=(
-                    args.batch_size
-                    if args.batch_size is not None
-                    else _DEFAULT_BATCH_SIZE
-                ),
-                max_batch_bytes=(
-                    args.max_batch_bytes if args.max_batch_bytes > 0 else None
-                ),
-                user_agent=args.user_agent,
-                respect_robots_txt=args.respect_robots_txt,
-                resume=args.resume,
-                retry_failed=args.retry_failed,
-                frontier_table=args.frontier_table,
-                frontier_batch_size=args.frontier_batch_size,
-                create_indexes=args.indexes,
-                optimize_every=args.optimize_every if args.optimize_every > 0 else None,
-                progress=reporter,
-            )
+        async with new_client_session() as session:
+            async with RoomClient(session=session) as room:
+                result = await import_domain_with_scrapy(
+                    room,
+                    url=args.url,
+                    table=args.table,
+                    namespace=_namespace(args.namespace),
+                    url_filter=_url_filter(args.url),
+                    response_filter=args.response_filter,
+                    content_format=args.format,
+                    clean=args.clean,
+                    limit=args.limit,
+                    concurrency=args.concurrency,
+                    batch_size=(
+                        args.batch_size
+                        if args.batch_size is not None
+                        else _DEFAULT_BATCH_SIZE
+                    ),
+                    max_batch_bytes=(
+                        args.max_batch_bytes if args.max_batch_bytes > 0 else None
+                    ),
+                    max_batch_delay=(
+                        args.max_batch_delay if args.max_batch_delay > 0 else None
+                    ),
+                    user_agent=args.user_agent,
+                    respect_robots_txt=args.respect_robots_txt,
+                    resume=args.resume,
+                    retry_failed=args.retry_failed,
+                    frontier_table=args.frontier_table,
+                    frontier_batch_size=args.frontier_batch_size,
+                    create_indexes=args.indexes,
+                    optimize_every=(
+                        args.optimize_every if args.optimize_every > 0 else None
+                    ),
+                    progress=reporter,
+                )
     finally:
         if reporter is not None:
             reporter.close()

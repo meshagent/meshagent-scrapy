@@ -273,6 +273,29 @@ async def _fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
     )
 
 
+async def _fake_delayed_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+    del kwargs
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/a",
+            content_type="text/plain",
+            body=b"Page A",
+        ),  # type: ignore[arg-type]
+        content=b"Page A",
+        request_url="https://example.com/a",
+    )
+    await asyncio.sleep(0.03)
+    yield _ScrapedPage(
+        response=_Response(
+            url="https://example.com/b",
+            content_type="text/plain",
+            body=b"Page B",
+        ),  # type: ignore[arg-type]
+        content=b"Page B",
+        request_url="https://example.com/b",
+    )
+
+
 async def _fake_scraped_pages_with_binary(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
     del kwargs
     yield _ScrapedPage(
@@ -707,6 +730,19 @@ async def test_import_domain_rejects_non_positive_max_batch_bytes(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_import_domain_rejects_non_positive_max_batch_delay(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    with pytest.raises(ValueError, match="max_batch_delay"):
+        await scrapy.import_domain_with_scrapy(
+            room,  # type: ignore[arg-type]
+            url="https://example.com",
+            max_batch_delay=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_import_domain_passes_concurrency_to_scrapy(monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -769,6 +805,24 @@ async def test_import_domain_flushes_content_batch_by_estimated_bytes(
         url="https://example.com",
         batch_size=100,
         max_batch_bytes=1,
+        clean="none",
+    )
+
+    assert result.imported_records == 2
+    assert [call["records"].num_rows for call in room.datasets.merge_calls] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_flushes_content_batch_by_delay(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_delayed_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=100,
+        max_batch_bytes=None,
+        max_batch_delay=0.01,
         clean="none",
     )
 

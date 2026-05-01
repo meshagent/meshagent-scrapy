@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -43,7 +44,8 @@ _DEFAULT_TEXT_RESPONSE_FILTER = (
     "contains(content_type_lower, 'json')"
 )
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
-_DEFAULT_BATCH_SIZE = 5000
+_DEFAULT_BATCH_SIZE = 1000
+_DEFAULT_MAX_BATCH_DELAY = 5 * 60
 
 warnings.filterwarnings(
     "ignore",
@@ -237,6 +239,7 @@ async def import_domain_with_scrapy(
     concurrency: int | None = None,
     batch_size: int = _DEFAULT_BATCH_SIZE,
     max_batch_bytes: int | None = _DEFAULT_MAX_BATCH_BYTES,
+    max_batch_delay: float | None = _DEFAULT_MAX_BATCH_DELAY,
     frontier_batch_size: int = 500,
     user_agent: str | None = None,
     respect_robots_txt: bool = False,
@@ -259,6 +262,8 @@ async def import_domain_with_scrapy(
         raise ValueError("batch_size must be greater than zero")
     if max_batch_bytes is not None and max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be greater than zero or None")
+    if max_batch_delay is not None and max_batch_delay <= 0:
+        raise ValueError("max_batch_delay must be greater than zero or None")
     if frontier_batch_size <= 0:
         raise ValueError("frontier_batch_size must be greater than zero")
     if primary_key == "":
@@ -391,6 +396,8 @@ async def import_domain_with_scrapy(
     batch: list[dict[str, Any]] = []
     batch_frontier_urls: list[str] = []
     batch_estimated_bytes = 0
+    content_batch_lock = asyncio.Lock()
+    content_batch_delay_task: asyncio.Task[None] | None = None
     frontier_batch: list[dict[str, Any]] = []
     unresolved_start_urls = set(start_urls) if resume else set()
     writes_since_optimize = 0
@@ -464,7 +471,37 @@ async def import_domain_with_scrapy(
         if len(frontier_batch) >= frontier_batch_size:
             await flush_frontier_batch()
 
+    async def cancel_content_batch_delay_task() -> None:
+        nonlocal content_batch_delay_task
+        task = content_batch_delay_task
+        if task is None or task is asyncio.current_task():
+            return
+        content_batch_delay_task = None
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    def schedule_content_batch_delay_task(current_url: str | None) -> None:
+        nonlocal content_batch_delay_task
+        if max_batch_delay is None or content_batch_delay_task is not None:
+            return
+
+        async def delayed_flush() -> None:
+            nonlocal content_batch_delay_task
+            try:
+                await asyncio.sleep(max_batch_delay)
+                await flush_content_batch(current_url=current_url)
+            finally:
+                if content_batch_delay_task is asyncio.current_task():
+                    content_batch_delay_task = None
+
+        content_batch_delay_task = asyncio.create_task(delayed_flush())
+
     async def flush_content_batch(current_url: str | None = None) -> None:
+        async with content_batch_lock:
+            await flush_content_batch_unlocked(current_url=current_url)
+
+    async def flush_content_batch_unlocked(current_url: str | None = None) -> None:
         nonlocal batch
         nonlocal batch_estimated_bytes
         nonlocal batch_frontier_urls
@@ -506,6 +543,7 @@ async def import_domain_with_scrapy(
         batch = []
         batch_frontier_urls = []
         batch_estimated_bytes = 0
+        await cancel_content_batch_delay_task()
         if resume:
             done_urls = _expand_frontier_urls(
                 merged_urls,
@@ -742,15 +780,20 @@ async def import_domain_with_scrapy(
                     f"extract callback must return primary key column {primary_key!r}"
                 )
             row_estimated_bytes = _estimated_record_bytes(row)
-            if (
-                max_batch_bytes is not None
-                and batch
-                and batch_estimated_bytes + row_estimated_bytes > max_batch_bytes
-            ):
-                await flush_content_batch(current_url=page.response.url)
-            batch.append(row)
-            batch_frontier_urls.extend(_page_frontier_urls(page))
-            batch_estimated_bytes += row_estimated_bytes
+            async with content_batch_lock:
+                if (
+                    max_batch_bytes is not None
+                    and batch
+                    and batch_estimated_bytes + row_estimated_bytes > max_batch_bytes
+                ):
+                    await flush_content_batch_unlocked(current_url=page.response.url)
+                if not batch:
+                    schedule_content_batch_delay_task(current_url=page.response.url)
+                batch.append(row)
+                batch_frontier_urls.extend(_page_frontier_urls(page))
+                batch_estimated_bytes += row_estimated_bytes
+                pending_records = len(batch)
+                should_flush_batch = pending_records >= batch_size
             await _report_progress(
                 progress,
                 stage="record_extracted",
@@ -758,16 +801,18 @@ async def import_domain_with_scrapy(
                 imported_records=imported_records,
                 skipped_records=skipped_records,
                 pages_read=pages_read,
-                pending_records=len(batch),
+                pending_records=pending_records,
                 current_url=page.response.url,
             )
-            if len(batch) >= batch_size:
+            if should_flush_batch:
                 await flush_content_batch(current_url=page.response.url)
         except Exception:
             logger.exception("failed to import Scrapy response %s", page.response.url)
+            await cancel_content_batch_delay_task()
             raise
 
     await flush_content_batch()
+    await cancel_content_batch_delay_task()
 
     await flush_frontier_batch()
 

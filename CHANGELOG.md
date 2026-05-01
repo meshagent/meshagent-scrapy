@@ -2,6 +2,7 @@
 - Added Scrapy import concurrency controls via `concurrency=` and the example crawler `--concurrency` flag.
 - Changed Scrapy imports to send a browser-like User-Agent by default while keeping `user_agent=` and `--user-agent` overrides.
 - Added size-aware Scrapy content merge batching with `max_batch_bytes=` and the example crawler `--max-batch-bytes` flag.
+- Changed the default Scrapy content row-count batch cap to 1000 and added time-aware flushing with `max_batch_delay=` and `--max-batch-delay`, defaulting to 5 minutes.
 - Changed Scrapy imports to skip non-text responses by default unless a custom response filter is supplied.
 - Breaking: Python scheduled-task client and spec models now use a `ScheduledTaskSpec` contract (including queue/container targeting) instead of separate queue/schedule/payload parameters.
 - Added Python scheduled-task run listing support with models/pages for runs and their status/attempt/timestamp fields.
