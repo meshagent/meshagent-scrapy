@@ -14,7 +14,8 @@ from meshagent.scrapy import ScrapyImportProgress, import_domain_with_scrapy
 _DEFAULT_BATCH_SIZE = 1000
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
 _DEFAULT_MAX_BATCH_DELAY = 5 * 60
-_STRIP_CHOICES = {"scripts", "css", "whitespace", "clean", "none"}
+_STRIP_CHOICES = {"scripts", "css", "whitespace", "clean", "image-data-urls", "none"}
+_INDEX_CHOICES = {"text"}
 
 
 def _namespace(value: str | None) -> list[str] | None:
@@ -46,6 +47,24 @@ def _strip(value: str | None) -> str | None:
     if "none" in parts and len(parts) > 1:
         raise argparse.ArgumentTypeError("--strip=none cannot be combined with others")
     return ",".join(parts)
+
+
+def _index(value: str) -> tuple[str, ...]:
+    parts = tuple(part.strip() for part in value.split(",") if part.strip() != "")
+    unknown = [part for part in parts if part not in _INDEX_CHOICES]
+    if unknown:
+        expected = ", ".join(sorted(_INDEX_CHOICES))
+        raise argparse.ArgumentTypeError(f"--index values must be one of: {expected}")
+    return parts
+
+
+def _indexes(values: list[tuple[str, ...]]) -> tuple[str, ...]:
+    indexes: list[str] = []
+    for group in values:
+        for value in group:
+            if value not in indexes:
+                indexes.append(value)
+    return tuple(indexes)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -137,8 +156,8 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Comma-separated HTML stripping options: scripts, css, whitespace, "
-            "clean, or none. Defaults to scripts for --format=html and clean "
-            "for md/text."
+            "image-data-urls, clean, or none. Defaults to scripts,image-data-urls "
+            "for --format=html and clean for md/text."
         ),
     )
     parser.add_argument(
@@ -147,7 +166,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=["before-links", "after-links", "none"],
         default=None,
         help=(
-            "Run stripping before or after extracting links/images. "
+            "Run stripping before or after extracting images. "
             "Use none as a deprecated alias for --strip=none."
         ),
     )
@@ -162,6 +181,17 @@ def _parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Create indexes for page and frontier tables",
+    )
+    parser.add_argument(
+        "--index",
+        action="append",
+        type=_index,
+        default=[],
+        metavar="COLUMN",
+        help=(
+            "Optional content index to create; use --index=text for the inverted "
+            "text index. May be repeated or comma-separated."
+        ),
     )
     parser.add_argument(
         "--optimize-every",
@@ -297,6 +327,7 @@ async def _main() -> None:
                     frontier_table=args.frontier_table,
                     frontier_batch_size=args.frontier_batch_size,
                     create_indexes=args.indexes,
+                    index_columns=_indexes(args.index),
                     optimize_every=(
                         args.optimize_every if args.optimize_every > 0 else None
                     ),

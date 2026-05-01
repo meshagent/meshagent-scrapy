@@ -10,7 +10,7 @@ import logging
 import re
 import warnings
 from typing import Any, Literal, TypeAlias
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from html_to_markdown import convert as html_to_markdown
 import jmespath
@@ -61,11 +61,16 @@ ExtractCallback: TypeAlias = Callable[
     Awaitable[ExtractedRecord | None],
 ]
 ContentFormat: TypeAlias = Literal["md", "html", "text"]
-StripKind: TypeAlias = Literal["scripts", "css", "whitespace", "clean"]
+StripKind: TypeAlias = Literal[
+    "scripts", "css", "whitespace", "clean", "image-data-urls"
+]
 StripOrder: TypeAlias = Literal["before-links", "after-links"]
 CleanMode: TypeAlias = Literal["before-links", "after-links", "none"]
 StripInput: TypeAlias = str | Sequence[StripKind] | None
-_STRIP_KINDS = frozenset({"scripts", "css", "whitespace", "clean"})
+IndexColumn: TypeAlias = Literal["text"]
+IndexInput: TypeAlias = Sequence[IndexColumn] | None
+_STRIP_KINDS = frozenset({"scripts", "css", "whitespace", "clean", "image-data-urls"})
+_INDEX_COLUMNS = frozenset({"text"})
 
 
 @dataclass(frozen=True)
@@ -149,19 +154,16 @@ class _TextExtractor(HTMLParser):
 
 
 class _HtmlAssetExtractor(HTMLParser):
-    def __init__(self, base_url: str) -> None:
+    def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._base_url = base_url
-        self._active_links: list[dict[str, Any]] = []
-        self.links: list[dict[str, Any]] = []
         self.images: list[dict[str, Any]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         normalized_tag = tag.lower()
-        if normalized_tag == "a":
-            self._active_links.append(self._link_record(attrs))
-        elif normalized_tag == "img":
-            self.images.append(self._image_record(attrs))
+        if normalized_tag == "img":
+            image = self._image_record(attrs)
+            if image is not None:
+                self.images.append(image)
 
     def handle_startendtag(
         self,
@@ -169,59 +171,20 @@ class _HtmlAssetExtractor(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         normalized_tag = tag.lower()
-        if normalized_tag == "a":
-            link = self._link_record(attrs)
-            link.pop("_parts")
-            link["content"] = ""
-            self.links.append(link)
-        elif normalized_tag == "img":
-            self.images.append(self._image_record(attrs))
+        if normalized_tag == "img":
+            image = self._image_record(attrs)
+            if image is not None:
+                self.images.append(image)
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() != "a" or not self._active_links:
-            return
-        link = self._active_links.pop()
-        link["content"] = " ".join(link.pop("_parts")).strip()
-        self.links.append(link)
-
-    def handle_data(self, data: str) -> None:
-        stripped = data.strip()
-        if not stripped:
-            return
-        for link in self._active_links:
-            link["_parts"].append(stripped)
-
-    def close(self) -> None:
-        super().close()
-        while self._active_links:
-            link = self._active_links.pop()
-            link["content"] = " ".join(link.pop("_parts")).strip()
-            self.links.append(link)
-
-    def _link_record(self, attrs: list[tuple[str, str | None]]) -> dict[str, Any]:
-        attr_list = _attribute_list(attrs)
-        href = _attribute_value(attrs, "href")
-        return {
-            "url": _absolute_url(self._base_url, href),
-            "href": href,
-            "content": "",
-            "title": _attribute_value(attrs, "title"),
-            "rel": _attribute_value(attrs, "rel"),
-            "target": _attribute_value(attrs, "target"),
-            "attributes": attr_list,
-            "_parts": [],
-        }
-
-    def _image_record(self, attrs: list[tuple[str, str | None]]) -> dict[str, Any]:
-        attr_list = _attribute_list(attrs)
+    def _image_record(
+        self, attrs: list[tuple[str, str | None]]
+    ) -> dict[str, Any] | None:
         src = _attribute_value(attrs, "src")
+        if src is None or src.strip() == "" or _is_data_url(src):
+            return None
         return {
-            "url": _absolute_url(self._base_url, src),
             "src": src,
             "alt": _attribute_value(attrs, "alt"),
-            "title": _attribute_value(attrs, "title"),
-            "srcset": _attribute_value(attrs, "srcset"),
-            "attributes": attr_list,
         }
 
 
@@ -254,6 +217,7 @@ async def import_domain_with_scrapy(
     retry_failed: bool = False,
     frontier_table: str | None = None,
     create_indexes: bool = True,
+    index_columns: IndexInput = None,
     optimize_every: int | None = 5000,
     progress: ProgressCallback | None = None,
 ) -> ScrapyImportResult:
@@ -289,6 +253,7 @@ async def import_domain_with_scrapy(
         clean=clean,
     )
     strip_order = _resolve_strip_order(strip_order=strip_order, clean=clean)
+    resolved_index_columns = _resolve_index_columns(index_columns)
 
     extractor = extract or _default_extractor(
         content_format=content_format,
@@ -316,6 +281,7 @@ async def import_domain_with_scrapy(
                 table=table,
                 primary_key=primary_key,
                 schema=schema,
+                index_columns=resolved_index_columns,
                 namespace=namespace,
                 branch=branch,
             )
@@ -547,6 +513,7 @@ async def import_domain_with_scrapy(
                 table=table,
                 primary_key=primary_key,
                 schema=schema,
+                index_columns=resolved_index_columns,
                 namespace=namespace,
                 branch=branch,
             )
@@ -1106,10 +1073,10 @@ async def _ensure_scrapy_indexes(
     table: str,
     primary_key: str,
     schema: pa.Schema | None,
+    index_columns: Sequence[IndexColumn],
     namespace: list[str] | None,
     branch: str | None,
 ) -> bool:
-    schema_names = set(schema.names) if schema is not None else set()
     primary_key_ready = await _ensure_index(
         room=room,
         table=table,
@@ -1119,38 +1086,23 @@ async def _ensure_scrapy_indexes(
         namespace=namespace,
         branch=branch,
     )
-    if "text" not in schema_names:
-        return primary_key_ready
-    text_ready = await _ensure_index(
-        room=room,
-        table=table,
-        column="text",
-        index_type="INVERTED",
-        name="meshagent_scrapy_text_inverted",
-        namespace=namespace,
-        branch=branch,
-    )
-    if "link_urls" not in schema_names or "image_urls" not in schema_names:
-        return primary_key_ready and text_ready
-    link_urls_ready = await _ensure_index(
-        room=room,
-        table=table,
-        column="link_urls",
-        index_type="LABEL_LIST",
-        name="meshagent_scrapy_link_urls_label_list",
-        namespace=namespace,
-        branch=branch,
-    )
-    image_urls_ready = await _ensure_index(
-        room=room,
-        table=table,
-        column="image_urls",
-        index_type="LABEL_LIST",
-        name="meshagent_scrapy_image_urls_label_list",
-        namespace=namespace,
-        branch=branch,
-    )
-    return primary_key_ready and text_ready and link_urls_ready and image_urls_ready
+    schema_names = set(schema.names) if schema is not None else set()
+    text_ready = True
+    if "text" in index_columns:
+        if "text" not in schema_names:
+            raise ValueError(
+                "cannot create text index because schema has no text column"
+            )
+        text_ready = await _ensure_index(
+            room=room,
+            table=table,
+            column="text",
+            index_type="INVERTED",
+            name="meshagent_scrapy_text_inverted",
+            namespace=namespace,
+            branch=branch,
+        )
+    return primary_key_ready and text_ready
 
 
 async def _ensure_frontier_indexes(
@@ -1521,7 +1473,6 @@ async def _default_extract(
     )
     asset_content = stripped_content if strip_order == "before-links" else content
     assets = _content_assets(
-        url=response.url,
         content=asset_content,
         content_type=content_type,
     )
@@ -1534,10 +1485,7 @@ async def _default_extract(
             content_type=content_type,
             content_format=content_format,
         ),
-        "links": assets["links"],
-        "link_urls": assets["link_urls"],
         "images": assets["images"],
-        "image_urls": assets["image_urls"],
     }
 
 
@@ -1572,27 +1520,20 @@ def _content_text(
 
 def _content_assets(
     *,
-    url: str,
     content: bytes,
     content_type: str,
 ) -> dict[str, list[Any]]:
     if not _is_html_content_type(content_type):
         return {
-            "links": [],
-            "link_urls": [],
             "images": [],
-            "image_urls": [],
         }
 
     decoded = content.decode(_charset(content_type), errors="replace")
-    parser = _HtmlAssetExtractor(url)
+    parser = _HtmlAssetExtractor()
     parser.feed(decoded)
     parser.close()
     return {
-        "links": parser.links,
-        "link_urls": _record_urls(parser.links),
         "images": parser.images,
-        "image_urls": _record_urls(parser.images),
     }
 
 
@@ -1609,7 +1550,7 @@ def _resolve_strip_kinds(
             raise ValueError("clean must be 'before-links', 'after-links', or 'none'")
         return () if clean == "none" else ("clean",)
     if content_format == "html":
-        return ("scripts",)
+        return ("scripts", "image-data-urls")
     return ("clean",)
 
 
@@ -1657,6 +1598,24 @@ def _parse_strip_kinds(strip: StripInput) -> tuple[StripKind, ...]:
     return tuple(unique_values)
 
 
+def _resolve_index_columns(index_columns: IndexInput) -> tuple[IndexColumn, ...]:
+    if index_columns is None:
+        return ()
+
+    values = tuple(str(value).strip() for value in index_columns if str(value).strip())
+    unknown = [value for value in values if value not in _INDEX_COLUMNS]
+    if unknown:
+        expected = ", ".join(sorted(_INDEX_COLUMNS))
+        raise ValueError(f"index_columns must contain only {expected}")
+
+    unique_values: list[IndexColumn] = []
+    for value in values:
+        typed_value = value  # type: ignore[assignment]
+        if typed_value not in unique_values:
+            unique_values.append(typed_value)
+    return tuple(unique_values)
+
+
 async def _strip_content(
     *,
     url: str,
@@ -1668,7 +1627,12 @@ async def _strip_content(
         return content
 
     stripped = content
-    if "scripts" in strip or "css" in strip or "whitespace" in strip:
+    if (
+        "scripts" in strip
+        or "css" in strip
+        or "whitespace" in strip
+        or "image-data-urls" in strip
+    ):
         stripped = await asyncio.to_thread(
             _strip_html_content_sync,
             content=stripped,
@@ -1694,6 +1658,10 @@ _STYLE_ATTR_RE = re.compile(
     r"""\s+style\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""",
     re.IGNORECASE | re.DOTALL,
 )
+_IMAGE_DATA_URL_ATTR_RE = re.compile(
+    r"""\s+(?:src|srcset)\s*=\s*("[^"]*\bdata:image/[^"]*"|'[^']*\bdata:image/[^']*'|[^\s>]*\bdata:image/[^\s>]*)""",
+    re.IGNORECASE | re.DOTALL,
+)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _BETWEEN_TAG_WHITESPACE_RE = re.compile(r">\s+<")
 _MULTI_WHITESPACE_RE = re.compile(r"[ \t\r\n]{2,}")
@@ -1713,6 +1681,8 @@ def _strip_html_content_sync(
         decoded = _STYLE_RE.sub("", decoded)
         decoded = _STYLESHEET_LINK_RE.sub("", decoded)
         decoded = _STYLE_ATTR_RE.sub("", decoded)
+    if "image-data-urls" in strip:
+        decoded = _IMAGE_DATA_URL_ATTR_RE.sub("", decoded)
     if "whitespace" in strip:
         decoded = _HTML_COMMENT_RE.sub("", decoded)
         decoded = _BETWEEN_TAG_WHITESPACE_RE.sub("><", decoded)
@@ -1767,13 +1737,8 @@ def _is_html_content_type(content_type: str) -> bool:
     return "html" in normalized_content_type or "xml" in normalized_content_type
 
 
-def _record_urls(records: Sequence[Mapping[str, Any]]) -> list[str]:
-    urls = []
-    for record in records:
-        value = record.get("url")
-        if isinstance(value, str) and value != "":
-            urls.append(value)
-    return _unique(urls)
+def _is_data_url(value: str | None) -> bool:
+    return value is not None and value.strip().lower().startswith("data:")
 
 
 def _estimated_record_bytes(value: Any) -> int:
@@ -1797,28 +1762,12 @@ def _estimated_record_bytes(value: Any) -> int:
     return len(str(value).encode("utf-8"))
 
 
-def _attribute_list(attrs: Sequence[tuple[str, str | None]]) -> list[dict[str, str]]:
-    return [
-        {
-            "name": name,
-            "value": "" if value is None else value,
-        }
-        for name, value in attrs
-    ]
-
-
 def _attribute_value(attrs: Sequence[tuple[str, str | None]], name: str) -> str | None:
     normalized_name = name.lower()
     for attr_name, value in attrs:
         if attr_name.lower() == normalized_name:
             return "" if value is None else value
     return None
-
-
-def _absolute_url(base_url: str, value: str | None) -> str | None:
-    if value is None or value.strip() == "":
-        return None
-    return urljoin(base_url, value)
 
 
 def _charset(content_type: str) -> str:
@@ -1836,10 +1785,7 @@ def _default_schema() -> pa.Schema:
             pa.field("date", pa.string()),
             pa.field("content_type", pa.string()),
             _compressed_string_field("text"),
-            pa.field("links", pa.list_(_link_struct_type())),
-            _compressed_string_list_field("link_urls"),
             pa.field("images", pa.list_(_image_struct_type())),
-            _compressed_string_list_field("image_urls"),
         ]
     )
 
@@ -1848,46 +1794,11 @@ def _compressed_string_field(name: str) -> pa.Field:
     return pa.field(name, pa.string(), metadata=_LANCE_ZSTD_FIELD_METADATA)
 
 
-def _compressed_string_list_field(name: str) -> pa.Field:
-    return pa.field(
-        name,
-        pa.list_(pa.field("item", pa.string(), metadata=_LANCE_ZSTD_FIELD_METADATA)),
-        metadata=_LANCE_ZSTD_FIELD_METADATA,
-    )
-
-
-def _attribute_struct_type() -> pa.StructType:
-    return pa.struct(
-        [
-            _compressed_string_field("name"),
-            _compressed_string_field("value"),
-        ]
-    )
-
-
-def _link_struct_type() -> pa.StructType:
-    return pa.struct(
-        [
-            _compressed_string_field("url"),
-            _compressed_string_field("href"),
-            _compressed_string_field("content"),
-            _compressed_string_field("title"),
-            _compressed_string_field("rel"),
-            _compressed_string_field("target"),
-            pa.field("attributes", pa.list_(_attribute_struct_type())),
-        ]
-    )
-
-
 def _image_struct_type() -> pa.StructType:
     return pa.struct(
         [
-            _compressed_string_field("url"),
             _compressed_string_field("src"),
             _compressed_string_field("alt"),
-            _compressed_string_field("title"),
-            _compressed_string_field("srcset"),
-            pa.field("attributes", pa.list_(_attribute_struct_type())),
         ]
     )
 

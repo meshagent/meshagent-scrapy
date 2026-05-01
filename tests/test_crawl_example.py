@@ -71,3 +71,16 @@ def test_max_batch_delay_cli_argument_is_available() -> None:
     )
 
     assert args.max_batch_delay == 30
+
+
+def test_index_cli_argument_accepts_text_index() -> None:
+    crawl = _load_crawl_example()
+
+    args = crawl._parser().parse_args(
+        [
+            "https://example.com",
+            "--index=text",
+        ],
+    )
+
+    assert crawl._indexes(args.index) == ("text",)
