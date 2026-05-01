@@ -46,6 +46,7 @@ _DEFAULT_TEXT_RESPONSE_FILTER = (
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
 _DEFAULT_BATCH_SIZE = 1000
 _DEFAULT_MAX_BATCH_DELAY = 5 * 60
+_LANCE_ZSTD_FIELD_METADATA = {b"lance-encoding:compression": b"zstd"}
 
 warnings.filterwarnings(
     "ignore",
@@ -60,7 +61,11 @@ ExtractCallback: TypeAlias = Callable[
     Awaitable[ExtractedRecord | None],
 ]
 ContentFormat: TypeAlias = Literal["md", "html", "text"]
+StripKind: TypeAlias = Literal["scripts", "css", "whitespace", "clean"]
+StripOrder: TypeAlias = Literal["before-links", "after-links"]
 CleanMode: TypeAlias = Literal["before-links", "after-links", "none"]
+StripInput: TypeAlias = str | Sequence[StripKind] | None
+_STRIP_KINDS = frozenset({"scripts", "css", "whitespace", "clean"})
 
 
 @dataclass(frozen=True)
@@ -232,7 +237,9 @@ async def import_domain_with_scrapy(
     primary_key: str = "url",
     response_filter: str | None = None,
     content_format: ContentFormat = "md",
-    clean: CleanMode = "before-links",
+    strip: StripInput = None,
+    strip_order: StripOrder = "before-links",
+    clean: CleanMode | None = None,
     namespace: list[str] | None = None,
     branch: str | None = None,
     limit: int | None = None,
@@ -276,12 +283,17 @@ async def import_domain_with_scrapy(
         raise ValueError("optimize_every must be greater than zero or None")
     if content_format not in {"md", "html", "text"}:
         raise ValueError("content_format must be 'md', 'html', or 'text'")
-    if clean not in {"before-links", "after-links", "none"}:
-        raise ValueError("clean must be 'before-links', 'after-links', or 'none'")
+    strip_kinds = _resolve_strip_kinds(
+        content_format=content_format,
+        strip=strip,
+        clean=clean,
+    )
+    strip_order = _resolve_strip_order(strip_order=strip_order, clean=clean)
 
     extractor = extract or _default_extractor(
         content_format=content_format,
-        clean=clean,
+        strip=strip_kinds,
+        strip_order=strip_order,
     )
     response_filter_expression = jmespath.compile(
         response_filter or _DEFAULT_TEXT_RESPONSE_FILTER
@@ -1477,14 +1489,16 @@ async def _report_progress(
 def _default_extractor(
     *,
     content_format: ContentFormat,
-    clean: CleanMode,
+    strip: Sequence[StripKind],
+    strip_order: StripOrder,
 ) -> ExtractCallback:
     async def extract(response: Response, content: bytes) -> dict[str, Any]:
         return await _default_extract(
             response=response,
             content=content,
             content_format=content_format,
-            clean=clean,
+            strip=strip,
+            strip_order=strip_order,
         )
 
     return extract
@@ -1495,19 +1509,17 @@ async def _default_extract(
     response: Response,
     content: bytes,
     content_format: ContentFormat,
-    clean: CleanMode,
+    strip: Sequence[StripKind],
+    strip_order: StripOrder,
 ) -> dict[str, Any]:
     content_type = _content_type(response)
-    clean_content = (
-        content
-        if clean == "none"
-        else await _trafilatura_content(
-            url=response.url,
-            content=content,
-            content_type=content_type,
-        )
+    stripped_content = await _strip_content(
+        url=response.url,
+        content=content,
+        content_type=content_type,
+        strip=strip,
     )
-    asset_content = clean_content if clean == "before-links" else content
+    asset_content = stripped_content if strip_order == "before-links" else content
     assets = _content_assets(
         url=response.url,
         content=asset_content,
@@ -1518,7 +1530,7 @@ async def _default_extract(
         "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "content_type": content_type,
         "text": _content_text(
-            content=clean_content,
+            content=stripped_content,
             content_type=content_type,
             content_format=content_format,
         ),
@@ -1582,6 +1594,130 @@ def _content_assets(
         "images": parser.images,
         "image_urls": _record_urls(parser.images),
     }
+
+
+def _resolve_strip_kinds(
+    *,
+    content_format: ContentFormat,
+    strip: StripInput,
+    clean: CleanMode | None,
+) -> tuple[StripKind, ...]:
+    if strip is not None:
+        return _parse_strip_kinds(strip)
+    if clean is not None:
+        if clean not in {"before-links", "after-links", "none"}:
+            raise ValueError("clean must be 'before-links', 'after-links', or 'none'")
+        return () if clean == "none" else ("clean",)
+    if content_format == "html":
+        return ("scripts",)
+    return ("clean",)
+
+
+def _resolve_strip_order(
+    *,
+    strip_order: StripOrder,
+    clean: CleanMode | None,
+) -> StripOrder:
+    if clean is not None:
+        if clean not in {"before-links", "after-links", "none"}:
+            raise ValueError("clean must be 'before-links', 'after-links', or 'none'")
+        if clean != "none":
+            return clean
+    if strip_order not in {"before-links", "after-links"}:
+        raise ValueError("strip_order must be 'before-links' or 'after-links'")
+    return strip_order
+
+
+def _parse_strip_kinds(strip: StripInput) -> tuple[StripKind, ...]:
+    if strip is None:
+        return ()
+    if isinstance(strip, str):
+        raw_values = [part.strip() for part in strip.split(",")]
+    else:
+        raw_values = [str(part).strip() for part in strip]
+
+    values = tuple(value for value in raw_values if value != "")
+    if not values:
+        return ()
+    if "none" in values:
+        if len(values) > 1:
+            raise ValueError("strip 'none' cannot be combined with other values")
+        return ()
+
+    unknown = [value for value in values if value not in _STRIP_KINDS]
+    if unknown:
+        expected = ", ".join(sorted(_STRIP_KINDS | {"none"}))
+        raise ValueError(f"strip must contain only {expected}")
+
+    unique_values: list[StripKind] = []
+    for value in values:
+        typed_value = value  # type: ignore[assignment]
+        if typed_value not in unique_values:
+            unique_values.append(typed_value)
+    return tuple(unique_values)
+
+
+async def _strip_content(
+    *,
+    url: str,
+    content: bytes,
+    content_type: str,
+    strip: Sequence[StripKind],
+) -> bytes:
+    if not strip or not _is_html_content_type(content_type):
+        return content
+
+    stripped = content
+    if "scripts" in strip or "css" in strip or "whitespace" in strip:
+        stripped = await asyncio.to_thread(
+            _strip_html_content_sync,
+            content=stripped,
+            content_type=content_type,
+            strip=strip,
+        )
+    if "clean" in strip:
+        stripped = await _trafilatura_content(
+            url=url,
+            content=stripped,
+            content_type=content_type,
+        )
+    return stripped
+
+
+_SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.IGNORECASE | re.DOTALL)
+_STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.IGNORECASE | re.DOTALL)
+_STYLESHEET_LINK_RE = re.compile(
+    r"""<link\b(?=[^>]*\brel\s*=\s*["']?stylesheet\b)[^>]*>""",
+    re.IGNORECASE | re.DOTALL,
+)
+_STYLE_ATTR_RE = re.compile(
+    r"""\s+style\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_BETWEEN_TAG_WHITESPACE_RE = re.compile(r">\s+<")
+_MULTI_WHITESPACE_RE = re.compile(r"[ \t\r\n]{2,}")
+
+
+def _strip_html_content_sync(
+    *,
+    content: bytes,
+    content_type: str,
+    strip: Sequence[StripKind],
+) -> bytes:
+    charset = _charset(content_type)
+    decoded = content.decode(charset, errors="replace")
+    if "scripts" in strip:
+        decoded = _SCRIPT_RE.sub("", decoded)
+    if "css" in strip:
+        decoded = _STYLE_RE.sub("", decoded)
+        decoded = _STYLESHEET_LINK_RE.sub("", decoded)
+        decoded = _STYLE_ATTR_RE.sub("", decoded)
+    if "whitespace" in strip:
+        decoded = _HTML_COMMENT_RE.sub("", decoded)
+        decoded = _BETWEEN_TAG_WHITESPACE_RE.sub("><", decoded)
+        decoded = _MULTI_WHITESPACE_RE.sub(" ", decoded).strip()
+    return decoded.encode(charset, errors="replace")
 
 
 async def _trafilatura_content(
@@ -1699,20 +1835,32 @@ def _default_schema() -> pa.Schema:
             pa.field("url", pa.string(), nullable=False),
             pa.field("date", pa.string()),
             pa.field("content_type", pa.string()),
-            pa.field("text", pa.string()),
+            _compressed_string_field("text"),
             pa.field("links", pa.list_(_link_struct_type())),
-            pa.field("link_urls", pa.list_(pa.string())),
+            _compressed_string_list_field("link_urls"),
             pa.field("images", pa.list_(_image_struct_type())),
-            pa.field("image_urls", pa.list_(pa.string())),
+            _compressed_string_list_field("image_urls"),
         ]
+    )
+
+
+def _compressed_string_field(name: str) -> pa.Field:
+    return pa.field(name, pa.string(), metadata=_LANCE_ZSTD_FIELD_METADATA)
+
+
+def _compressed_string_list_field(name: str) -> pa.Field:
+    return pa.field(
+        name,
+        pa.list_(pa.field("item", pa.string(), metadata=_LANCE_ZSTD_FIELD_METADATA)),
+        metadata=_LANCE_ZSTD_FIELD_METADATA,
     )
 
 
 def _attribute_struct_type() -> pa.StructType:
     return pa.struct(
         [
-            pa.field("name", pa.string()),
-            pa.field("value", pa.string()),
+            _compressed_string_field("name"),
+            _compressed_string_field("value"),
         ]
     )
 
@@ -1720,12 +1868,12 @@ def _attribute_struct_type() -> pa.StructType:
 def _link_struct_type() -> pa.StructType:
     return pa.struct(
         [
-            pa.field("url", pa.string()),
-            pa.field("href", pa.string()),
-            pa.field("content", pa.string()),
-            pa.field("title", pa.string()),
-            pa.field("rel", pa.string()),
-            pa.field("target", pa.string()),
+            _compressed_string_field("url"),
+            _compressed_string_field("href"),
+            _compressed_string_field("content"),
+            _compressed_string_field("title"),
+            _compressed_string_field("rel"),
+            _compressed_string_field("target"),
             pa.field("attributes", pa.list_(_attribute_struct_type())),
         ]
     )
@@ -1734,11 +1882,11 @@ def _link_struct_type() -> pa.StructType:
 def _image_struct_type() -> pa.StructType:
     return pa.struct(
         [
-            pa.field("url", pa.string()),
-            pa.field("src", pa.string()),
-            pa.field("alt", pa.string()),
-            pa.field("title", pa.string()),
-            pa.field("srcset", pa.string()),
+            _compressed_string_field("url"),
+            _compressed_string_field("src"),
+            _compressed_string_field("alt"),
+            _compressed_string_field("title"),
+            _compressed_string_field("srcset"),
             pa.field("attributes", pa.list_(_attribute_struct_type())),
         ]
     )

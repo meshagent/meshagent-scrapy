@@ -14,6 +14,7 @@ from meshagent.scrapy import ScrapyImportProgress, import_domain_with_scrapy
 _DEFAULT_BATCH_SIZE = 1000
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
 _DEFAULT_MAX_BATCH_DELAY = 5 * 60
+_STRIP_CHOICES = {"scripts", "css", "whitespace", "clean", "none"}
 
 
 def _namespace(value: str | None) -> list[str] | None:
@@ -32,6 +33,19 @@ def _url_filter(value: str) -> str:
     if path == "":
         return f"^https?://{re.escape(host)}(/.*)?$"
     return f"^https?://{re.escape(host)}{re.escape(path)}(/.*)?$"
+
+
+def _strip(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parts = [part.strip() for part in value.split(",") if part.strip() != ""]
+    unknown = [part for part in parts if part not in _STRIP_CHOICES]
+    if unknown:
+        expected = ", ".join(sorted(_STRIP_CHOICES))
+        raise argparse.ArgumentTypeError(f"--strip values must be one of: {expected}")
+    if "none" in parts and len(parts) > 1:
+        raise argparse.ArgumentTypeError("--strip=none cannot be combined with others")
+    return ",".join(parts)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -118,10 +132,30 @@ def _parser() -> argparse.ArgumentParser:
         help="Content format for the default text column",
     )
     parser.add_argument(
-        "--clean",
+        "--strip",
+        type=_strip,
+        default=None,
+        help=(
+            "Comma-separated HTML stripping options: scripts, css, whitespace, "
+            "clean, or none. Defaults to scripts for --format=html and clean "
+            "for md/text."
+        ),
+    )
+    parser.add_argument(
+        "--strip-order",
+        dest="strip_order",
         choices=["before-links", "after-links", "none"],
-        default="before-links",
-        help="Run Trafilatura cleanup before links/images, after links/images, or not at all",
+        default=None,
+        help=(
+            "Run stripping before or after extracting links/images. "
+            "Use none as a deprecated alias for --strip=none."
+        ),
+    )
+    parser.add_argument(
+        "--clean",
+        dest="strip_order",
+        choices=["before-links", "after-links", "none"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--indexes",
@@ -233,7 +267,16 @@ async def _main() -> None:
                     url_filter=_url_filter(args.url),
                     response_filter=args.response_filter,
                     content_format=args.format,
-                    clean=args.clean,
+                    strip=(
+                        "none"
+                        if args.strip is None and args.strip_order == "none"
+                        else args.strip
+                    ),
+                    strip_order=(
+                        "before-links"
+                        if args.strip_order in (None, "none")
+                        else args.strip_order
+                    ),
                     limit=args.limit,
                     concurrency=args.concurrency,
                     batch_size=(

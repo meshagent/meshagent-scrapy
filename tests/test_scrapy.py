@@ -251,6 +251,24 @@ class _FakeRoom:
     datasets: _FakeDatasets
 
 
+def test_default_schema_marks_large_text_fields_for_lance_zstd() -> None:
+    schema = scrapy._default_schema()
+
+    assert schema.field("text").metadata == {b"lance-encoding:compression": b"zstd"}
+    assert schema.field("link_urls").metadata == {
+        b"lance-encoding:compression": b"zstd"
+    }
+    assert schema.field("image_urls").metadata == {
+        b"lance-encoding:compression": b"zstd"
+    }
+    assert schema.field("links").type.value_type.field("content").metadata == {
+        b"lance-encoding:compression": b"zstd"
+    }
+    assert schema.field("images").type.value_type.field("srcset").metadata == {
+        b"lance-encoding:compression": b"zstd"
+    }
+
+
 async def _fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
     del kwargs
     yield _ScrapedPage(
@@ -678,6 +696,58 @@ async def test_import_domain_can_keep_html(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_import_domain_html_defaults_to_strip_scripts(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=1,
+        content_format="html",
+    )
+
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == (
+        "<html><head></head><body>Hello <b>A</b></body></html>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_import_domain_html_strip_csv_controls_css_and_whitespace(
+    monkeypatch,
+) -> None:
+    async def fake_scraped_page(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+        del kwargs
+        content = (
+            b"<html>\n  <head><style>.x { color: red; }</style></head>\n"
+            b'  <body><p style="color: red">Hello</p></body>\n</html>'
+        )
+        yield _ScrapedPage(
+            response=_Response(
+                url="https://example.com/a",
+                content_type="text/html; charset=utf-8",
+                body=content,
+            ),  # type: ignore[arg-type]
+            content=content,
+            request_url="https://example.com/a",
+        )
+
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", fake_scraped_page)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        content_format="html",
+        strip="css,whitespace",
+    )
+
+    assert room.datasets.merge_calls[0]["records"].to_pylist()[0]["text"] == (
+        "<html><head></head><body><p>Hello</p></body></html>"
+    )
+
+
+@pytest.mark.asyncio
 async def test_import_domain_rejects_unknown_content_format(monkeypatch) -> None:
     monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
     room = _FakeRoom(datasets=_FakeDatasets())
@@ -700,6 +770,19 @@ async def test_import_domain_rejects_unknown_clean(monkeypatch) -> None:
             room,  # type: ignore[arg-type]
             url="https://example.com",
             clean="always",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_import_domain_rejects_unknown_strip(monkeypatch) -> None:
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    with pytest.raises(ValueError, match="strip"):
+        await scrapy.import_domain_with_scrapy(
+            room,  # type: ignore[arg-type]
+            url="https://example.com",
+            strip="scripts,nope",
         )
 
 
