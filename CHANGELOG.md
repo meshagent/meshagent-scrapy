@@ -1,6 +1,9 @@
 ## [0.39.5]
 - Added Scrapy crawler HTML/content stripping configuration via new `strip` and `strip_order` inputs (including support for stripping `scripts`, `css`, `whitespace`, `clean`, and `image-data-urls`)
 - Changed default behavior for `content_format="html"` to strip `scripts` and inline image data URLs while preserving the rest of the HTML (and updated `--clean` CLI usage to map onto the new stripping configuration)
+- Changed the default Scrapy content row-count batch cap from 1000 to 100.
+- Changed the default Scrapy content max batch delay from 5 minutes to 60 seconds.
+- Added retry handling for transient Scrapy dataset write disconnects before skipping the failed content batch.
 - Broke Scrapy dataset output schema by removing `links`, `link_urls`, `image_urls`, and reducing `images` to `src`/`alt` only; inline image data URLs are excluded from extracted images
 - Changed index creation defaults: automatic creation no longer includes inverted/label indexes for removed link/image URL columns; `text` inverted index creation is now opt-in via `index_columns=("text",)`
 - Updated generated dataset schema to apply ZSTD compression metadata to large string fields (including `text` and image fields)

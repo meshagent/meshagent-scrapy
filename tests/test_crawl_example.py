@@ -17,7 +17,7 @@ def _load_crawl_example():
 def test_example_crawler_uses_standard_count_batch_default() -> None:
     crawl = _load_crawl_example()
 
-    assert crawl._DEFAULT_BATCH_SIZE == 1000
+    assert crawl._DEFAULT_BATCH_SIZE == 100
 
 
 def test_example_crawler_uses_size_batch_default() -> None:
@@ -29,7 +29,7 @@ def test_example_crawler_uses_size_batch_default() -> None:
 def test_example_crawler_uses_batch_delay_default() -> None:
     crawl = _load_crawl_example()
 
-    assert crawl._DEFAULT_MAX_BATCH_DELAY == 5 * 60
+    assert crawl._DEFAULT_MAX_BATCH_DELAY == 60
 
 
 def test_batch_size_cli_argument_is_available() -> None:

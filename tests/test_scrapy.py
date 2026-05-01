@@ -78,6 +78,8 @@ class _FakeDatasets:
         self.create_index_calls: list[dict[str, Any]] = []
         self.optimize_calls: list[dict[str, Any]] = []
         self.raise_existing_schema_conflict = False
+        self.create_failures_remaining = 0
+        self.merge_failures_remaining = 0
 
     async def create_table_with_schema(
         self,
@@ -97,6 +99,12 @@ class _FakeDatasets:
                 "branch": branch,
             }
         )
+        if self.create_failures_remaining > 0:
+            self.create_failures_remaining -= 1
+            raise RoomException(
+                "room connection closed before request completed: "
+                "websocket closed with code 1006"
+            )
         if self.raise_existing_schema_conflict and name in self.schemas:
             raise RoomException(
                 f"Error creating table '{name}': Table '{name}' already exists "
@@ -153,6 +161,12 @@ class _FakeDatasets:
                 "branch": branch,
             }
         )
+        if self.merge_failures_remaining > 0:
+            self.merge_failures_remaining -= 1
+            raise RoomException(
+                "room connection closed before request completed: "
+                "websocket closed with code 1006"
+            )
         existing_rows = self.search_rows.setdefault(table, [])
         by_url = {
             row["url"]: row for row in existing_rows if isinstance(row.get("url"), str)
@@ -918,6 +932,63 @@ async def test_import_domain_flushes_content_batch_by_estimated_bytes(
 
     assert result.imported_records == 2
     assert [call["records"].num_rows for call in room.datasets.merge_calls] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_retries_retryable_room_writes(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(scrapy.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    datasets = _FakeDatasets()
+    datasets.create_failures_remaining = 2
+    room = _FakeRoom(datasets=datasets)
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=2,
+        clean="none",
+        create_indexes=False,
+        max_batch_delay=None,
+    )
+
+    assert result.imported_records == 2
+    assert result.skipped_records == 0
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_import_domain_skips_batch_after_retryable_write_failures(
+    monkeypatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(scrapy.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", _fake_scraped_pages)
+    datasets = _FakeDatasets()
+    datasets.merge_failures_remaining = 4
+    room = _FakeRoom(datasets=datasets)
+
+    result = await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        batch_size=2,
+        clean="none",
+        create_indexes=False,
+        max_batch_delay=None,
+    )
+
+    assert result.imported_records == 0
+    assert result.skipped_records == 2
+    assert len(datasets.search_rows.get("scrapy", [])) == 0
+    assert sleeps == [1.0, 2.0, 4.0]
 
 
 @pytest.mark.asyncio

@@ -11,9 +11,9 @@ from meshagent.api import RoomClient
 from meshagent.api.http import new_client_session
 from meshagent.scrapy import ScrapyImportProgress, import_domain_with_scrapy
 
-_DEFAULT_BATCH_SIZE = 1000
+_DEFAULT_BATCH_SIZE = 100
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
-_DEFAULT_MAX_BATCH_DELAY = 5 * 60
+_DEFAULT_MAX_BATCH_DELAY = 60
 _STRIP_CHOICES = {"scripts", "css", "whitespace", "clean", "image-data-urls", "none"}
 _INDEX_CHOICES = {"text"}
 
@@ -259,6 +259,7 @@ class _ProgressReporter:
             "request_failed": "failed",
             "record_extracted": "extracting",
             "record_skipped": "skipping",
+            "batch_write_failed": "write failed",
             "batch_merged": "merged",
             "optimizing": "optimizing",
             "optimized": "optimized",
