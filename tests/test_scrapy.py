@@ -268,10 +268,17 @@ class _FakeRoom:
 def test_default_schema_marks_large_text_fields_for_lance_zstd() -> None:
     schema = scrapy._default_schema()
 
+    assert pa.types.is_large_string(schema.field("text").type)
     assert schema.field("text").metadata == {b"lance-encoding:compression": b"zstd"}
+    assert pa.types.is_large_string(
+        schema.field("images").type.value_type.field("src").type
+    )
     assert schema.field("images").type.value_type.field("src").metadata == {
         b"lance-encoding:compression": b"zstd"
     }
+    assert pa.types.is_large_string(
+        schema.field("images").type.value_type.field("alt").type
+    )
     assert schema.field("images").type.value_type.field("alt").metadata == {
         b"lance-encoding:compression": b"zstd"
     }

@@ -1997,7 +1997,7 @@ def _default_schema() -> pa.Schema:
 
 
 def _compressed_string_field(name: str) -> pa.Field:
-    return pa.field(name, pa.string(), metadata=_LANCE_ZSTD_FIELD_METADATA)
+    return pa.field(name, pa.large_string(), metadata=_LANCE_ZSTD_FIELD_METADATA)
 
 
 def _image_struct_type() -> pa.StructType:
