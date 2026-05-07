@@ -10,7 +10,14 @@ import pytest
 
 from meshagent.api import RoomException
 from meshagent.scrapy import scrapy
-from meshagent.scrapy.scrapy import ScrapyImportProgress, _ScrapedFailure, _ScrapedPage
+from scrapy.http import TextResponse
+
+from meshagent.scrapy.scrapy import (
+    ScrapyImportProgress,
+    _ScrapedDiscovery,
+    _ScrapedFailure,
+    _ScrapedPage,
+)
 
 
 class _Headers:
@@ -896,6 +903,27 @@ async def test_import_domain_passes_concurrency_to_scrapy(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_import_domain_passes_include_sitemap_to_scrapy(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_scraped_pages(**kwargs: Any) -> AsyncIterator[_ScrapedPage]:
+        captured.update(kwargs)
+        if False:
+            yield
+
+    monkeypatch.setattr(scrapy, "_iter_scraped_pages", fake_scraped_pages)
+    room = _FakeRoom(datasets=_FakeDatasets())
+
+    await scrapy.import_domain_with_scrapy(
+        room,  # type: ignore[arg-type]
+        url="https://example.com",
+        include_sitemap=True,
+    )
+
+    assert captured["include_sitemap"] is True
+
+
+@pytest.mark.asyncio
 async def test_import_domain_dedupes_primary_keys_in_merge_batch(monkeypatch) -> None:
     monkeypatch.setattr(
         scrapy, "_iter_scraped_pages", _fake_duplicate_primary_key_pages
@@ -1356,6 +1384,7 @@ async def test_scrapy_request_defaults_do_not_send_accept_language(monkeypatch) 
             concurrency=None,
             user_agent=None,
             respect_robots_txt=False,
+            include_sitemap=False,
             known_urls=set(),
         )
     ]
@@ -1396,6 +1425,7 @@ async def test_scrapy_user_agent_override_sets_scrapy_user_agent(monkeypatch) ->
             concurrency=None,
             user_agent="meshagent-test",
             respect_robots_txt=False,
+            include_sitemap=False,
             known_urls=set(),
         )
     ]
@@ -1430,12 +1460,73 @@ async def test_scrapy_concurrency_sets_scrapy_concurrent_requests(monkeypatch) -
             concurrency=5,
             user_agent=None,
             respect_robots_txt=False,
+            include_sitemap=False,
             known_urls=set(),
         )
     ]
 
     assert events == []
     assert captured_settings["spider"]["CONCURRENT_REQUESTS"] == 5
+
+
+@pytest.mark.asyncio
+async def test_scrapy_include_sitemap_discovers_sitemap_urls(monkeypatch) -> None:
+    captured_start_urls: list[str] = []
+    sitemap_body = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/from-sitemap</loc></url>
+  <url><loc>https://other.example.com/external</loc></url>
+</urlset>
+"""
+
+    class FakeRunner:
+        def __init__(self, settings: dict[str, Any]) -> None:
+            del settings
+
+        def crawl(self, spider_cls: Any) -> asyncio.Future[None]:
+            async def run_spider() -> None:
+                spider = spider_cls()
+                async for request in spider.start():
+                    captured_start_urls.append(request.url)
+                    if request.url == "https://example.com/sitemap.xml":
+                        response = TextResponse(
+                            url=request.url,
+                            body=sitemap_body,
+                            encoding="utf-8",
+                            request=request,
+                        )
+                        request.callback(response)
+
+            return asyncio.create_task(run_spider())
+
+    monkeypatch.setattr(scrapy, "AsyncCrawlerRunner", FakeRunner)
+
+    events = [
+        event
+        async for event in scrapy._iter_scraped_pages(
+            start_urls=["https://example.com/"],
+            domain=None,
+            url_filter=None,
+            limit=1,
+            concurrency=None,
+            user_agent=None,
+            respect_robots_txt=False,
+            include_sitemap=True,
+            known_urls=set(),
+        )
+    ]
+
+    assert captured_start_urls == [
+        "https://example.com/robots.txt",
+        "https://example.com/sitemap.xml",
+        "https://example.com/",
+    ]
+    assert events == [
+        _ScrapedDiscovery(
+            source_url="https://example.com/sitemap.xml",
+            discovered_urls=("https://example.com/from-sitemap",),
+        )
+    ]
 
 
 @pytest.mark.asyncio

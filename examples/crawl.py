@@ -210,6 +210,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Ask Scrapy to obey robots.txt",
     )
     parser.add_argument(
+        "--include-sitemap",
+        action="store_true",
+        help="Seed the crawl with URLs from robots.txt sitemaps and /sitemap.xml",
+    )
+    parser.add_argument(
         "--silent",
         action="store_true",
         help="Suppress progress output",
@@ -323,6 +328,7 @@ async def _main() -> None:
                     ),
                     user_agent=args.user_agent,
                     respect_robots_txt=args.respect_robots_txt,
+                    include_sitemap=args.include_sitemap,
                     resume=args.resume,
                     retry_failed=args.retry_failed,
                     frontier_table=args.frontier_table,

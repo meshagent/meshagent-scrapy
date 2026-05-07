@@ -73,6 +73,19 @@ def test_max_batch_delay_cli_argument_is_available() -> None:
     assert args.max_batch_delay == 30
 
 
+def test_include_sitemap_cli_argument_is_available() -> None:
+    crawl = _load_crawl_example()
+
+    args = crawl._parser().parse_args(
+        [
+            "https://example.com",
+            "--include-sitemap",
+        ],
+    )
+
+    assert args.include_sitemap is True
+
+
 def test_index_cli_argument_accepts_text_index() -> None:
     crawl = _load_crawl_example()
 

@@ -43,6 +43,11 @@ exhaustion while importing full HTML pages.
 The crawler sends a browser-like User-Agent by default. Pass `--user-agent` or
 `user_agent=` to override it for a specific crawl.
 
+Pass `--include-sitemap` or `include_sitemap=True` to seed the crawl with URLs
+from `Sitemap:` entries in `/robots.txt` and from `/sitemap.xml`. Sitemap URLs
+are filtered to the same domain and by `url_filter` before the crawler requests
+them; normal page link discovery remains enabled.
+
 The default extractor writes page content as markdown in the `text` column. Use
 `--format=html` to keep HTML, `--format=text` to strip markup to plain text, or
 pass `content_format=` from library code.

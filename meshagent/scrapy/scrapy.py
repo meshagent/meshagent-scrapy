@@ -29,6 +29,7 @@ from scrapy.crawler import AsyncCrawlerRunner
 from scrapy.exceptions import CloseSpider
 from scrapy.http import Response
 from scrapy.linkextractors import LinkExtractor
+from scrapy.utils.sitemap import Sitemap, sitemap_urls_from_robots
 
 logger = logging.getLogger(__name__)
 _FAILURE_HTTP_STATUS_CODES = tuple(range(400, 600))
@@ -122,7 +123,13 @@ class _ScrapedFailure:
     content_type: str | None = None
 
 
-_ScrapedEvent: TypeAlias = _ScrapedPage | _ScrapedFailure
+@dataclass(frozen=True)
+class _ScrapedDiscovery:
+    source_url: str
+    discovered_urls: tuple[str, ...]
+
+
+_ScrapedEvent: TypeAlias = _ScrapedPage | _ScrapedFailure | _ScrapedDiscovery
 
 
 @dataclass(frozen=True)
@@ -216,6 +223,7 @@ async def import_domain_with_scrapy(
     frontier_batch_size: int = 500,
     user_agent: str | None = None,
     respect_robots_txt: bool = False,
+    include_sitemap: bool = False,
     resume: bool = False,
     retry_failed: bool = False,
     frontier_table: str | None = None,
@@ -228,8 +236,9 @@ async def import_domain_with_scrapy(
 
     The default extractor writes `url`, `date`, `content_type`, and `text`,
     merging on `url`. Pass `schema` when a custom extractor should create an
-    empty table before the first row. Pass `progress` to receive async progress
-    updates during the import.
+    empty table before the first row. Pass `include_sitemap=True` to seed the
+    crawl from robots.txt sitemap entries and `/sitemap.xml`. Pass `progress` to
+    receive async progress updates during the import.
     """
 
     if batch_size <= 0:
@@ -712,6 +721,7 @@ async def import_domain_with_scrapy(
         concurrency=concurrency,
         user_agent=user_agent,
         respect_robots_txt=respect_robots_txt,
+        include_sitemap=include_sitemap,
         known_urls=set(frontier) if resume else set(),
     ):
         if isinstance(event, _ScrapedFailure):
@@ -753,6 +763,39 @@ async def import_domain_with_scrapy(
                 pending_records=len(batch),
                 current_url=event.url,
             )
+            continue
+
+        if isinstance(event, _ScrapedDiscovery):
+            if resume and event.discovered_urls:
+                new_frontier_rows = []
+                for discovered_url in event.discovered_urls:
+                    frontier_url = _frontier_url(discovered_url)
+                    if frontier_url in frontier:
+                        continue
+                    frontier[frontier_url] = "pending"
+                    frontier_aliases.setdefault(frontier_url, {})[frontier_url] = (
+                        "pending"
+                    )
+                    discovered_urls += 1
+                    new_frontier_rows.append(
+                        _frontier_row(
+                            url=frontier_url,
+                            status="pending",
+                            source_url=event.source_url,
+                        )
+                    )
+                if new_frontier_rows:
+                    await append_frontier_rows(new_frontier_rows)
+                    await _report_progress(
+                        progress,
+                        stage="frontier_discovered",
+                        matched_records=matched_records,
+                        imported_records=imported_records,
+                        skipped_records=skipped_records,
+                        pages_read=pages_read,
+                        pending_records=len(batch),
+                        current_url=event.source_url,
+                    )
             continue
 
         page = event
@@ -982,6 +1025,7 @@ async def _iter_scraped_pages(
     concurrency: int | None,
     user_agent: str | None,
     respect_robots_txt: bool,
+    include_sitemap: bool,
     known_urls: set[str],
 ) -> AsyncIterator[_ScrapedEvent]:
     if limit == 0 or len(start_urls) == 0:
@@ -989,6 +1033,7 @@ async def _iter_scraped_pages(
 
     start_url = start_urls[0]
     allowed_domain = _domain(start_url if domain is None else domain)
+    sitemap_urls = _sitemap_seed_urls(start_url) if include_sitemap else ()
     filters = _compiled_url_filters(url_filter)
     queue: asyncio.Queue[_ScrapedEvent | None] = asyncio.Queue()
     spider_settings: dict[str, Any] = {
@@ -1013,8 +1058,18 @@ async def _iter_scraped_pages(
             self._link_extractor = LinkExtractor()
             self._sent_pages = 0
             self._seen_urls = set(known_urls)
+            self._seen_sitemap_urls: set[str] = set()
 
         async def start(self) -> Any:
+            for sitemap_url in sitemap_urls:
+                self._seen_sitemap_urls.add(sitemap_url)
+                yield Request(
+                    sitemap_url,
+                    callback=self.parse_sitemap,
+                    errback=self._errback,
+                    dont_filter=True,
+                    meta={"handle_httpstatus_list": _FAILURE_HTTP_STATUS_CODES},
+                )
             for request_url in start_urls:
                 self._seen_urls.add(request_url)
                 yield Request(
@@ -1077,6 +1132,85 @@ async def _iter_scraped_pages(
                 )
                 for discovered_url in discovered_urls
             ]
+
+        def parse_sitemap(self, response: Response) -> list[Request]:
+            if response.status >= 400:
+                return []
+
+            if response.url.endswith("/robots.txt"):
+                sitemap_urls = [
+                    _frontier_url(sitemap_url)
+                    for sitemap_url in sitemap_urls_from_robots(
+                        response.body,
+                        base_url=response.url,
+                    )
+                    if _domain(sitemap_url) == allowed_domain
+                ]
+                return self._sitemap_requests(sitemap_urls)
+
+            try:
+                sitemap = Sitemap(response.body)
+            except Exception:
+                logger.warning("ignoring invalid sitemap: %s", response.url)
+                return []
+
+            if sitemap.type == "sitemapindex":
+                sitemap_urls = [
+                    _frontier_url(entry["loc"])
+                    for entry in sitemap
+                    if _domain(entry["loc"]) == allowed_domain
+                ]
+                return self._sitemap_requests(sitemap_urls)
+
+            if sitemap.type != "urlset":
+                logger.warning("ignoring invalid sitemap: %s", response.url)
+                return []
+
+            discovered_urls = []
+            for entry in sitemap:
+                discovered_url = _frontier_url(entry["loc"])
+                if _domain(discovered_url) != allowed_domain:
+                    continue
+                if not _matches_filters(discovered_url, filters):
+                    continue
+                if discovered_url in self._seen_urls:
+                    continue
+                self._seen_urls.add(discovered_url)
+                discovered_urls.append(discovered_url)
+
+            if discovered_urls:
+                queue.put_nowait(
+                    _ScrapedDiscovery(
+                        source_url=response.url,
+                        discovered_urls=tuple(discovered_urls),
+                    )
+                )
+
+            return [
+                Request(
+                    discovered_url,
+                    callback=self.parse,
+                    errback=self._errback,
+                    meta={"handle_httpstatus_list": _FAILURE_HTTP_STATUS_CODES},
+                )
+                for discovered_url in discovered_urls
+            ]
+
+        def _sitemap_requests(self, sitemap_urls: Sequence[str]) -> list[Request]:
+            requests = []
+            for sitemap_url in sitemap_urls:
+                if sitemap_url in self._seen_sitemap_urls:
+                    continue
+                self._seen_sitemap_urls.add(sitemap_url)
+                requests.append(
+                    Request(
+                        sitemap_url,
+                        callback=self.parse_sitemap,
+                        errback=self._errback,
+                        meta={"handle_httpstatus_list": _FAILURE_HTTP_STATUS_CODES},
+                    )
+                )
+            return requests
 
         def _errback(self, failure: Any) -> None:
             request = failure.request
@@ -2080,6 +2214,12 @@ def _frontier_url(value: str) -> str:
             "",
         )
     )
+
+
+def _sitemap_seed_urls(start_url: str) -> tuple[str, str]:
+    parsed = urlparse(start_url)
+    origin = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), "", "", "", ""))
+    return (f"{origin}/robots.txt", f"{origin}/sitemap.xml")
 
 
 def _frontier_status_rank(status: str) -> int:
