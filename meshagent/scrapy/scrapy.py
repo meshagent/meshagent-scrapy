@@ -20,6 +20,7 @@ from trafilatura import extract as trafilatura_extract
 from meshagent.api import (
     DatasetIndexConfig,
     DatasetOptimizeConfig,
+    LANCE_ZSTD_FIELD_METADATA,
     RoomClient,
     RoomException,
 )
@@ -49,7 +50,6 @@ _DEFAULT_BATCH_SIZE = 100
 _DEFAULT_MAX_BATCH_DELAY = 60
 _ROOM_WRITE_RETRIES = 3
 _ROOM_WRITE_RETRY_BASE_DELAY_SECONDS = 1.0
-_LANCE_ZSTD_FIELD_METADATA = {b"lance-encoding:compression": b"zstd"}
 
 warnings.filterwarnings(
     "ignore",
@@ -2131,7 +2131,7 @@ def _default_schema() -> pa.Schema:
 
 
 def _compressed_string_field(name: str) -> pa.Field:
-    return pa.field(name, pa.large_string(), metadata=_LANCE_ZSTD_FIELD_METADATA)
+    return pa.field(name, pa.large_string(), metadata=LANCE_ZSTD_FIELD_METADATA)
 
 
 def _image_struct_type() -> pa.StructType:
